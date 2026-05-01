@@ -1,0 +1,629 @@
+import numpy as np
+import pandas as pd
+import SimpleITK as sitk
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+
+ROOT = Path(r"C:\Users\chews\OneDrive\Desktop\New FYP\ALL SCENES")
+MAX_CLASSES = 155
+
+VENTRICLE_CLASSES = [4, 14, 15, 24, 43, 44, 72] 
+
+REGION_INFO = {
+    0: {"name": "Background", "color": "black"},
+    1: {"name": "Basal Ganglia", "color": "#808080"},
+    2: {"name": "Cerebellum", "color": "#4B0082"},
+    3: {"name": "Brain stem", "color": "#008000"},
+    4: {"name": "ventricular septum", "color": "#0000FF"},
+    5: {"name": "white matter", "color": "#CCFF00"},
+    6: {"name": "Frontal lobe", "color": "#FF0000"},
+    7: {"name": "Parietal lobe", "color": "#00FFFF"},
+    8: {"name": "Temporal lobe", "color": "#FFFF00"},
+    9: {"name": "Occipital lobe", "color": "#FF00FF"},
+    10: {"name": "Insula", "color": "#00FF00"}
+}
+
+
+def find_t1_pp(tf: Path) -> Path | None:
+    for p in sorted(list(tf.rglob("*.nii")) + list(tf.rglob("*.nii.gz"))):
+        n = p.name.lower()
+        if "mprage" in n and "_pp" in n and "lesion" not in n: return p
+    return None
+
+def find_raw_macro(tf: Path) -> Path | None:
+    for p in sorted(list(tf.rglob("*.nii")) + list(tf.rglob("*.nii.gz"))):
+        n = p.name.lower()
+        if "macro_t1space_filled" in n and "aligned" not in n and "resampled_brains" not in n: return p
+    return None
+
+def find_lesion_mask(tf: Path) -> Path | None:
+    cands = sorted(list(tf.rglob("*.nii")) + list(tf.rglob("*.nii.gz")))
+    priority = [p for p in cands if "lesion" in p.name.lower() and "mask" in p.name.lower()]
+    return priority[0] if priority else next((p for p in cands if "lesion" in p.name.lower()), None)
+
+
+def clean_old_outputs(root: Path, time_folders: list[Path]):
+    print("Cleaning old outputs...\n")
+    targets = [
+        "resampled_brains.nii.gz", "macro_T1space_filled_aligned_no_z_lock.nii.gz",
+        "alignment_qc.png", "final_form.nii.gz", 
+        "lesion_filled_macro.nii.gz", "lesion_fill_illustration.png", "lesion_region_report.txt"
+    ]
+    for tf in time_folders:
+        for t in targets:
+            f = tf / t
+            if f.exists(): f.unlink()
+
+    for csv in ["resampled_brains_geometry_report.csv", "brain_volume_summary.csv", "brain_volume_per_label.csv"]:
+        f = root / csv
+        if f.exists(): f.unlink()
+
+def geom_dict(img: sitk.Image, prefix: str) -> dict:
+    return {
+        f"{prefix}_size_x": img.GetSize()[0], f"{prefix}_size_y": img.GetSize()[1], f"{prefix}_size_z": img.GetSize()[2],
+        f"{prefix}_spacing_x": img.GetSpacing()[0], f"{prefix}_spacing_y": img.GetSpacing()[1], f"{prefix}_spacing_z": img.GetSpacing()[2],
+        f"{prefix}_origin_x": img.GetOrigin()[0], f"{prefix}_origin_y": img.GetOrigin()[1], f"{prefix}_origin_z": img.GetOrigin()[2],
+        f"{prefix}_direction": tuple(round(v, 6) for v in img.GetDirection())
+    }
+
+def compare_geometry(a: sitk.Image, b: sitk.Image) -> dict:
+    return {
+        "same_size": a.GetSize() == b.GetSize(), "same_spacing": tuple(a.GetSpacing()) == tuple(b.GetSpacing()),
+        "same_origin": tuple(a.GetOrigin()) == tuple(b.GetOrigin()), "same_direction": tuple(a.GetDirection()) == tuple(b.GetDirection())
+    }
+
+def calculate_dice(img_a: sitk.Image, img_b: sitk.Image) -> float:
+    if img_a.GetSize() != img_b.GetSize() or img_a.GetSpacing() != img_b.GetSpacing():
+        img_b = sitk.Resample(sitk.Cast(img_b, sitk.sitkUInt8), img_a, sitk.Transform(), sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
+        
+    arr_a = sitk.GetArrayViewFromImage(img_a) > 0
+    arr_b = sitk.GetArrayViewFromImage(img_b) > 0
+    intersection = np.sum(arr_a & arr_b)
+    sum_masks = np.sum(arr_a) + np.sum(arr_b)
+    
+    return 0.0 if sum_masks == 0 else (2.0 * intersection / sum_masks)
+
+def total_nonzero_volume(img: sitk.Image):
+    arr = sitk.GetArrayViewFromImage(img)
+    vox = int(np.count_nonzero(arr))
+    sx, sy, sz = img.GetSpacing()
+    mm3 = vox * float(sx * sy * sz)
+    return vox, mm3, mm3 / 1000.0
+
+def per_label_volumes(lbl: sitk.Image):
+    arr = sitk.GetArrayViewFromImage(lbl)
+    vv = float(lbl.GetSpacing()[0] * lbl.GetSpacing()[1] * lbl.GetSpacing()[2])
+    labels, counts = np.unique(arr, return_counts=True)
+    rows = []
+    for lab, cnt in zip(labels, counts):
+        if int(lab) == 0: continue
+        rows.append({"label": int(lab), "voxels": int(cnt), "volume_mm3": int(cnt) * vv, "volume_mL": (int(cnt) * vv) / 1000.0})
+    return rows
+
+
+def strict_align_macro_to_pp(lbl: sitk.Image, ref: sitk.Image):
+    lbl_cast = sitk.Cast(lbl, sitk.sitkUInt16)
+    lbl_arr = sitk.GetArrayViewFromImage(lbl)
+    ref_mask = sitk.Cast(ref > 0, sitk.sitkUInt8)
+    ref_arr = sitk.GetArrayViewFromImage(ref_mask)
+
+    l_z, l_y, l_x = np.where(lbl_arr > 0)
+    r_z, r_y, r_x = np.where(ref_arr > 0)
+
+    l_center_idx = [(l_x.min() + l_x.max()) / 2.0, (l_y.min() + l_y.max()) / 2.0, (l_z.min() + l_z.max()) / 2.0]
+    r_center_idx = [(r_x.min() + r_x.max()) / 2.0, (r_y.min() + r_y.max()) / 2.0, (r_z.min() + r_z.max()) / 2.0]
+
+    lbl_center_phys = lbl.TransformContinuousIndexToPhysicalPoint(l_center_idx)
+    ref_center_phys = ref.TransformContinuousIndexToPhysicalPoint(r_center_idx)
+    offset = [l - r for l, r in zip(lbl_center_phys, ref_center_phys)]
+
+    lbl_mask_f32 = sitk.Cast(lbl > 0, sitk.sitkFloat32)
+    ref_f32 = sitk.Cast(ref_mask, sitk.sitkFloat32)
+
+    best_dice, best_angle = -1, 0
+    for angle in np.arange(-15, 16, 1):
+        tx = sitk.Euler3DTransform()
+        tx.SetCenter(ref_center_phys); tx.SetTranslation(offset); tx.SetRotation(0, 0, np.radians(angle))
+        res_mask = sitk.Resample(lbl_mask_f32, ref_f32, tx, sitk.sitkNearestNeighbor, 0.0, sitk.sitkFloat32)
+        res_arr = sitk.GetArrayViewFromImage(res_mask)
+        intersection = np.sum((res_arr > 0) & (ref_arr > 0))
+        sum_masks = np.sum(res_arr > 0) + np.sum(ref_arr > 0)
+        if sum_masks > 0 and (2.0 * intersection / sum_masks) > best_dice:
+            best_dice = 2.0 * intersection / sum_masks; best_angle = angle
+
+    best_fine_angle = best_angle
+    for angle in np.arange(best_angle - 1.0, best_angle + 1.2, 0.2):
+        tx = sitk.Euler3DTransform()
+        tx.SetCenter(ref_center_phys); tx.SetTranslation(offset); tx.SetRotation(0, 0, np.radians(angle))
+        res_mask = sitk.Resample(lbl_mask_f32, ref_f32, tx, sitk.sitkNearestNeighbor, 0.0, sitk.sitkFloat32)
+        res_arr = sitk.GetArrayViewFromImage(res_mask)
+        intersection = np.sum((res_arr > 0) & (ref_arr > 0))
+        sum_masks = np.sum(res_arr > 0) + np.sum(ref_arr > 0)
+        if sum_masks > 0 and (2.0 * intersection / sum_masks) > best_dice:
+            best_dice = 2.0 * intersection / sum_masks; best_fine_angle = angle
+
+    final_tx = sitk.Euler3DTransform()
+    final_tx.SetCenter(ref_center_phys); final_tx.SetTranslation(offset); final_tx.SetRotation(0, 0, np.radians(best_fine_angle))
+    return sitk.Resample(lbl_cast, ref, final_tx, sitk.sitkNearestNeighbor, 0, sitk.sitkUInt16)
+
+def rigid_align_macro_to_pp(lbl: sitk.Image, ref: sitk.Image):
+    lbl_cast = sitk.Cast(lbl, sitk.sitkUInt16)
+    moving_mask = sitk.Cast(lbl > 0, sitk.sitkFloat32)
+    fixed_mask = sitk.Cast(ref > 0, sitk.sitkFloat32)
+
+    initial_tx = sitk.CenteredTransformInitializer(fixed_mask, moving_mask, sitk.Euler3DTransform(), sitk.CenteredTransformInitializerFilter.GEOMETRY)
+    
+    reg = sitk.ImageRegistrationMethod()
+    reg.SetMetricAsMattesMutualInformation(numberOfHistogramBins=32)
+    reg.SetMetricSamplingStrategy(reg.RANDOM)
+    reg.SetMetricSamplingPercentage(0.2)
+    reg.SetInterpolator(sitk.sitkLinear)
+    reg.SetOptimizerAsRegularStepGradientDescent(learningRate=1.0, minStep=1e-4, numberOfIterations=250, gradientMagnitudeTolerance=1e-8)
+    reg.SetOptimizerScalesFromPhysicalShift()
+    reg.SetShrinkFactorsPerLevel([4, 2, 1])
+    reg.SetSmoothingSigmasPerLevel([2, 1, 0])
+    reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+    reg.SetInitialTransform(initial_tx, inPlace=False)
+
+    final_tx = reg.Execute(fixed_mask, moving_mask)
+    aligned = sitk.Resample(lbl_cast, ref, final_tx, sitk.sitkNearestNeighbor, 0, sitk.sitkUInt16)
+    return aligned, final_tx, reg.GetMetricValue(), reg.GetOptimizerStopConditionDescription()
+
+def sanitize_labels(lbl_img: sitk.Image) -> sitk.Image:
+    arr = sitk.GetArrayFromImage(lbl_img).astype(np.int64, copy=False)
+    arr[(arr < 0) | (arr > MAX_CLASSES)] = 0
+    out = sitk.GetImageFromArray(arr.astype(np.uint16))
+    out.CopyInformation(lbl_img)
+    return out
+
+def smart_fill_lesions_and_internal_holes(macro_u16: sitk.Image, lesion_img: sitk.Image | None, pp_img: sitk.Image):
+    macro_arr = sitk.GetArrayFromImage(macro_u16)
+    
+    if lesion_img:
+        lesion_mask = sitk.GetArrayFromImage(lesion_img) > 0
+    else:
+        lesion_mask = np.zeros_like(macro_arr, dtype=bool)
+
+    # 1. Base T1 footprint
+    t1_arr = sitk.GetArrayFromImage(pp_img)
+    t1_mask_arr = t1_arr > 1e-4
+
+    non_zero_voxels = t1_arr[t1_mask_arr]
+    if len(non_zero_voxels) > 0:
+        intensity_threshold = np.mean(non_zero_voxels) * 0.5
+    else:
+        intensity_threshold = 0
+    high_intensity_spots = t1_arr > intensity_threshold
+
+ 
+    Z_b, Y_b, X_b = np.where(t1_mask_arr)
+    if len(Z_b) > 0:
+        z_min, z_max = Z_b.min(), Z_b.max()
+        y_min, y_max = Y_b.min(), Y_b.max()
+        x_min, x_max = X_b.min(), X_b.max()
+
+        z_span, y_span, x_span = z_max - z_min, y_max - y_min, x_max - x_min
+        z_mid, y_mid, x_mid = z_min + z_span/2.0, y_min + y_span/2.0, x_min + x_span/2.0
+
+        
+        z_lim_min, z_lim_max = z_mid - (z_span * 0.20), z_mid + (z_span * 0.20)
+        y_lim_min, y_lim_max = y_mid - (y_span * 0.20), y_mid + (y_span * 0.20)
+        x_lim_min, x_lim_max = x_mid - (x_span * 0.20), x_mid + (x_span * 0.20)
+
+        Z_idx, Y_idx, X_idx = np.indices(macro_arr.shape)
+        core_sensor_box = (Z_idx >= z_lim_min) & (Z_idx <= z_lim_max) & \
+                          (Y_idx >= y_lim_min) & (Y_idx <= y_lim_max) & \
+                          (X_idx >= x_lim_min) & (X_idx <= x_lim_max)
+    else:
+        core_sensor_box = np.zeros_like(macro_arr, dtype=bool)
+
+    
+    vent_mask = np.isin(macro_arr, VENTRICLE_CLASSES).astype(np.uint8)
+    vent_img = sitk.GetImageFromArray(vent_mask)
+    vent_img.CopyInformation(macro_u16)
+
+    cc_filter = sitk.ConnectedComponentImageFilter()
+    cc_img = cc_filter.Execute(vent_img)
+    cc_arr = sitk.GetArrayFromImage(cc_img)
+
+    valid_ventricle_mask = np.zeros_like(macro_arr, dtype=bool)
+
+    
+    if cc_filter.GetObjectCount() > 0:
+        labels = np.unique(cc_arr[cc_arr > 0])
+        for lab in labels:
+            blob_mask = (cc_arr == lab)
+            if np.any(blob_mask & core_sensor_box):
+                valid_ventricle_mask = valid_ventricle_mask | blob_mask
+
+    
+    stray_ventricles = np.isin(macro_arr, VENTRICLE_CLASSES) & (~valid_ventricle_mask)
+    macro_arr[stray_ventricles] = 0
+
+    
+    valid_vent_img = sitk.GetImageFromArray(valid_ventricle_mask.astype(np.uint8))
+    valid_vent_img.CopyInformation(macro_u16)
+    vault_img = sitk.BinaryDilate(valid_vent_img, [5, 5, 5])
+    containment_arr = sitk.GetArrayFromImage(vault_img) > 0
+
+    macro_u16_cleaned = sitk.GetImageFromArray(macro_arr.astype(np.uint16))
+    macro_u16_cleaned.CopyInformation(macro_u16)
+    macro_binary = sitk.Cast(macro_u16_cleaned > 0, sitk.sitkUInt8)
+    
+    macro_filled_binary = sitk.BinaryFillhole(macro_binary, fullyConnected=True)
+    internal_holes = (sitk.GetArrayFromImage(macro_filled_binary) > 0) & (macro_arr == 0)
+
+    t1_mask_img = sitk.GetImageFromArray(t1_mask_arr.astype(np.uint8))
+    t1_mask_img.CopyInformation(macro_u16)
+    safe_core_img = sitk.BinaryErode(t1_mask_img, [3, 3, 1])
+    safe_core_arr = sitk.GetArrayFromImage(safe_core_img) > 0
+    internal_holes = internal_holes & safe_core_arr
+
+    bg_z = np.where(macro_arr == 1)[0]
+    bs_z = np.where(macro_arr == 3)[0]
+    if len(bg_z) > 0 and len(bs_z) > 0:
+        bs_mean = np.mean(bs_z)
+        bg_mean = np.mean(bg_z)
+        bs_binary = sitk.GetImageFromArray((macro_arr == 3).astype(np.uint8))
+        bs_binary.CopyInformation(macro_u16_cleaned)
+        bs_territory_img = sitk.BinaryDilate(bs_binary, [12, 12, 120])
+        bs_territory = sitk.GetArrayFromImage(bs_territory_img) > 0
+        Z, _, _ = np.indices(macro_arr.shape)
+        inferior_mask = (Z < bs_mean) if bs_mean < bg_mean else (Z > bs_mean)
+        stem_protrusion = bs_territory & inferior_mask & t1_mask_arr & (macro_arr == 0)
+    else:
+        stem_protrusion = np.zeros_like(macro_arr, dtype=bool)
+
+    target_mask = internal_holes | lesion_mask | high_intensity_spots | stem_protrusion
+    fill_locations = target_mask & (macro_arr == 0)
+
+    if not np.any(fill_locations):
+        empty = sitk.GetImageFromArray(np.zeros_like(macro_arr, dtype=np.uint8))
+        empty.CopyInformation(macro_u16_cleaned)
+        return macro_u16_cleaned, empty
+
+    
+    seed_img_all = sitk.GetImageFromArray(macro_arr.astype(np.uint16))
+    seed_img_all.CopyInformation(macro_u16_cleaned)
+
+    dist_filter_all = sitk.DanielssonDistanceMapImageFilter()
+    dist_filter_all.SetInputIsBinary(False)
+    dist_filter_all.SetUseImageSpacing(True)
+    dist_filter_all.Execute(seed_img_all)
+    nearest_arr_all = sitk.GetArrayFromImage(sitk.Cast(dist_filter_all.GetVoronoiMap(), sitk.sitkUInt16))
+
+    
+    macro_arr_no_vent = np.copy(macro_arr)
+    macro_arr_no_vent[np.isin(macro_arr_no_vent, VENTRICLE_CLASSES)] = 0 
+    
+    seed_img_no_vent = sitk.GetImageFromArray(macro_arr_no_vent.astype(np.uint16))
+    seed_img_no_vent.CopyInformation(macro_u16_cleaned)
+
+    dist_filter_no_vent = sitk.DanielssonDistanceMapImageFilter()
+    dist_filter_no_vent.SetInputIsBinary(False)
+    dist_filter_no_vent.SetUseImageSpacing(True)
+    dist_filter_no_vent.Execute(seed_img_no_vent)
+    nearest_arr_no_vent = sitk.GetArrayFromImage(sitk.Cast(dist_filter_no_vent.GetVoronoiMap(), sitk.sitkUInt16))
+
+    
+    nearest_arr = np.copy(nearest_arr_all)
+    
+    
+    outside_vault = ~containment_arr
+    nearest_arr[outside_vault] = nearest_arr_no_vent[outside_vault]
+    
+    
+    nearest_arr[stem_protrusion] = 3
+
+    filled_arr = np.copy(macro_arr)
+    filled_arr[fill_locations] = nearest_arr[fill_locations]
+
+    valid_space = t1_mask_arr | internal_holes
+    filled_arr[~valid_space] = 0
+    fill_locations[~valid_space] = False
+
+    filled_arr[~t1_mask_arr] = 0
+    fill_locations[~t1_mask_arr] = False
+    
+    binary_filled = sitk.GetImageFromArray((filled_arr > 0).astype(np.uint8))
+    binary_filled.CopyInformation(macro_u16_cleaned)
+    
+    cc = sitk.ConnectedComponent(binary_filled)
+    cc_arr = sitk.GetArrayFromImage(cc)
+    
+    if np.count_nonzero(cc_arr) > 0:
+        labels, counts = np.unique(cc_arr[cc_arr > 0], return_counts=True)
+        largest_cc_label = labels[np.argmax(counts)]
+        
+        island_mask = (cc_arr > 0) & (cc_arr != largest_cc_label)
+        filled_arr[island_mask] = 0
+        fill_locations[island_mask] = False
+
+    filled_img = sitk.GetImageFromArray(filled_arr.astype(np.uint16))
+    filled_img.CopyInformation(macro_u16_cleaned)
+
+    target_mask_img = sitk.GetImageFromArray(fill_locations.astype(np.uint8))
+    target_mask_img.CopyInformation(macro_u16_cleaned)
+    
+    return filled_img, target_mask_img
+
+
+def show_alignment(pp_img, before_macro, after_macro, title, step_name, dice_before, dice_after):
+    if pp_img.GetSize() != before_macro.GetSize() or pp_img.GetSpacing() != before_macro.GetSpacing():
+        before_macro = sitk.Resample(sitk.Cast(before_macro, sitk.sitkUInt8), pp_img, sitk.Transform(), sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
+
+    pp_arr = sitk.GetArrayViewFromImage(pp_img)
+    before_macro_arr = sitk.GetArrayViewFromImage(before_macro)
+    after_macro_arr = sitk.GetArrayViewFromImage(after_macro)
+    
+    slice_sums = np.sum(after_macro_arr > 0, axis=(1, 2))
+    z_view = len(slice_sums)//2 if np.max(slice_sums) == 0 else int(np.argmax(slice_sums))
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    fig.suptitle(f"{title} | {step_name}", fontsize=16)
+    
+    before_masked = np.ma.masked_where(before_macro_arr[z_view, :, :] == 0, before_macro_arr[z_view, :, :])
+    after_masked = np.ma.masked_where(after_macro_arr[z_view, :, :] == 0, after_macro_arr[z_view, :, :])
+
+    axes[0].imshow(pp_arr[z_view, :, :], cmap='gray')
+    axes[0].imshow(before_masked, cmap='jet', alpha=0.4, interpolation='nearest')
+    axes[0].set_title(f"Before (Dice: {dice_before:.4f})")
+    axes[0].axis('off')
+
+    axes[1].imshow(pp_arr[z_view, :, :], cmap='gray')
+    axes[1].imshow(after_masked, cmap='jet', alpha=0.4, interpolation='nearest')
+    axes[1].set_title(f"After (Dice: {dice_after:.4f})")
+    axes[1].axis('off')
+
+    plt.tight_layout()
+    plt.show(block=False)
+    plt.pause(4) 
+    plt.close()
+
+def save_alignment_qc(pp_img: sitk.Image, macro_img: sitk.Image, out_png: Path, title: str):
+    pp = sitk.GetArrayViewFromImage(pp_img)
+    macro = sitk.GetArrayViewFromImage(macro_img)
+    nz = np.argwhere(macro > 0)
+    
+    if len(nz) == 0: zc, yc, xc = pp.shape[0] // 2, pp.shape[1] // 2, pp.shape[2] // 2
+    else:
+        zc = int((nz[:, 0].min() + nz[:, 0].max()) / 2)
+        yc = int((nz[:, 1].min() + nz[:, 1].max()) / 2)
+        xc = int((nz[:, 2].min() + nz[:, 2].max()) / 2)
+
+    fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+    fig.suptitle(title, fontsize=14)
+
+    ax[0].imshow(pp[zc, :, :], cmap="gray", origin="lower")
+    ax[0].imshow(np.ma.masked_where(macro[zc, :, :] == 0, macro[zc, :, :]), cmap="jet", alpha=0.35, origin="lower")
+    ax[0].set_title(f"Axial z={zc}"); ax[0].axis("off")
+
+    ax[1].imshow(pp[:, yc, :], cmap="gray", origin="lower")
+    ax[1].imshow(np.ma.masked_where(macro[:, yc, :] == 0, macro[:, yc, :]), cmap="jet", alpha=0.35, origin="lower")
+    ax[1].set_title(f"Coronal y={yc}"); ax[1].axis("off")
+
+    ax[2].imshow(pp[:, :, xc], cmap="gray", origin="lower")
+    ax[2].imshow(np.ma.masked_where(macro[:, :, xc] == 0, macro[:, :, xc]), cmap="jet", alpha=0.35, origin="lower")
+    ax[2].set_title(f"Sagittal x={xc}"); ax[2].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+def save_progression_plot(tf: Path, subj_name: str, rank: str, final_dice: float, root: Path):
+    print(f"Generating Progression QC for {rank} Performer: {subj_name}...")
+    
+    pp_path = find_t1_pp(tf)
+    raw_path = find_raw_macro(tf)
+    centroid_path = tf / "macro_T1space_filled_aligned_no_z_lock.nii.gz"
+    rigid_path = tf / "resampled_brains.nii.gz"
+    final_path = tf / "final_form.nii.gz"
+
+    pp_img = sitk.ReadImage(str(pp_path))
+    raw_img = sitk.ReadImage(str(raw_path))
+    cent_img = sitk.ReadImage(str(centroid_path))
+    rigid_img = sitk.ReadImage(str(rigid_path))
+    final_img = sitk.ReadImage(str(final_path))
+
+    if pp_img.GetSize() != raw_img.GetSize() or pp_img.GetSpacing() != raw_img.GetSpacing():
+        raw_img = sitk.Resample(sitk.Cast(raw_img, sitk.sitkUInt8), pp_img, sitk.Transform(), sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
+
+    pp_arr = sitk.GetArrayViewFromImage(pp_img)
+    raw_arr = sitk.GetArrayViewFromImage(raw_img)
+    cent_arr = sitk.GetArrayViewFromImage(cent_img)
+    rigid_arr = sitk.GetArrayViewFromImage(rigid_img)
+    final_arr = sitk.GetArrayViewFromImage(final_img)
+
+    nz = np.argwhere(final_arr > 0)
+    if len(nz) == 0:
+        zc, yc, xc = pp_arr.shape[0]//2, pp_arr.shape[1]//2, pp_arr.shape[2]//2
+    else:
+        zc = int((nz[:, 0].min() + nz[:, 0].max()) / 2)
+        yc = int((nz[:, 1].min() + nz[:, 1].max()) / 2)
+        xc = int((nz[:, 2].min() + nz[:, 2].max()) / 2)
+
+    fig, ax = plt.subplots(3, 4, figsize=(20, 15))
+    fig.suptitle(f"{rank} Registration Progression | {subj_name} | Final Dice: {final_dice:.4f}", fontsize=20, y=0.95)
+
+    stages = [
+        ("1. Pre-Alignment (Raw)", raw_arr),
+        ("2. Centroid Aligned", cent_arr),
+        ("3. Rigid Aligned", rigid_arr),
+        ("4. Final Smart Fill", final_arr)
+    ]
+
+    for col, (title, mask_arr) in enumerate(stages):
+        ax[0, col].imshow(pp_arr[zc, :, :], cmap="gray", origin="lower")
+        ax[0, col].imshow(np.ma.masked_where(mask_arr[zc, :, :] == 0, mask_arr[zc, :, :]), cmap="jet", alpha=0.4, origin="lower", interpolation='nearest')
+        ax[0, col].set_title(title, fontsize=16)
+        ax[0, col].axis("off")
+        if col == 0: ax[0, col].text(-10, pp_arr.shape[1]//2, "Axial", rotation=90, va='center', ha='right', fontsize=14, fontweight='bold')
+
+        ax[1, col].imshow(pp_arr[:, yc, :], cmap="gray", origin="lower")
+        ax[1, col].imshow(np.ma.masked_where(mask_arr[:, yc, :] == 0, mask_arr[:, yc, :]), cmap="jet", alpha=0.4, origin="lower", interpolation='nearest')
+        ax[1, col].axis("off")
+        if col == 0: ax[1, col].text(-10, pp_arr.shape[0]//2, "Coronal", rotation=90, va='center', ha='right', fontsize=14, fontweight='bold')
+
+        ax[2, col].imshow(pp_arr[:, :, xc], cmap="gray", origin="lower")
+        ax[2, col].imshow(np.ma.masked_where(mask_arr[:, :, xc] == 0, mask_arr[:, :, xc]), cmap="jet", alpha=0.4, origin="lower", interpolation='nearest')
+        ax[2, col].axis("off")
+        if col == 0: ax[2, col].text(-10, pp_arr.shape[0]//2, "Sagittal", rotation=90, va='center', ha='right', fontsize=14, fontweight='bold')
+
+    plt.tight_layout()
+    out_file = root / f"Progression_QC_{rank}_{subj_name.replace('/', '_')}.png"
+    plt.savefig(out_file, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def main():
+    if not ROOT.exists(): raise FileNotFoundError(f"ROOT not found: {ROOT}")
+
+    time_folders = sorted([p for p in ROOT.glob(r"SUBJ*\Time*") if p.is_dir()])
+    print(f"Found {len(time_folders)} Time folders.\n")
+    clean_old_outputs(ROOT, time_folders)
+
+    report_rows, volume_rows, label_rows = [], [], []
+    patient_performance = []
+    ok = skip = fail = 0
+
+    for tf in time_folders:
+        subj_time = f"{tf.parent.name}/{tf.name}"
+        try:
+            pp_path = find_t1_pp(tf)
+            raw_macro_path = find_raw_macro(tf)
+            lesion_path = find_lesion_mask(tf)
+
+            if not pp_path or not raw_macro_path:
+                print(f"[!] SKIP {subj_time} -> missing PP or source macro")
+                skip += 1
+                continue
+
+            print(f"\n[+] Processing: {subj_time}")
+            pp_img = sitk.ReadImage(str(pp_path))
+            raw_macro_img = sitk.ReadImage(str(raw_macro_path))
+            
+            dice_orig = calculate_dice(pp_img, raw_macro_img)
+
+            # PHASE 1: SCRIPT 4 (Strict Centroid Alignment) ---
+            print("   -> Running Script 4: Strict Centroid Alignment")
+            strict_macro = strict_align_macro_to_pp(lbl=raw_macro_img, ref=pp_img)
+            
+            dice_s4 = calculate_dice(pp_img, strict_macro)
+            print(f"      -> Script 4 Dice Improved: {dice_orig:.4f} -> {dice_s4:.4f}")
+            
+            sitk.WriteImage(strict_macro, str(tf / "macro_T1space_filled_aligned_no_z_lock.nii.gz"), useCompression=True)
+            show_alignment(pp_img, raw_macro_img, strict_macro, subj_time, "Step 4: Centroid Alignment", dice_orig, dice_s4)
+
+            # PHASE 2: SCRIPT 4.5 (3D Rigid Optimizer) ---
+            print("   -> Running Script 4.5: Full 3D Rigid Alignment")
+            rigid_macro, final_tx, metric_val, stop_cond = rigid_align_macro_to_pp(lbl=raw_macro_img, ref=pp_img)
+            
+            dice_s45 = calculate_dice(pp_img, rigid_macro)
+            print(f"      -> Script 4.5 Dice Improved: {dice_orig:.4f} -> {dice_s45:.4f}")
+
+            sitk.WriteImage(rigid_macro, str(tf / "resampled_brains.nii.gz"), useCompression=True)
+            save_alignment_qc(pp_img, rigid_macro, tf / "alignment_qc.png", subj_time)
+            show_alignment(pp_img, raw_macro_img, rigid_macro, subj_time, "Step 4.5: 3D Registration", dice_orig, dice_s45)
+
+            # PHASE 3: SMART LESION + INTERNAL HOLE FILL ---
+            print("   -> Running Script 3: Smart Lesion & Internal Hole Fill")
+            rigid_macro = sanitize_labels(rigid_macro) 
+            
+            lesion_img = None
+            if lesion_path:
+                lesion_img = sitk.ReadImage(str(lesion_path))
+                if lesion_img.GetSize() != rigid_macro.GetSize():
+                    lesion_img = sitk.Resample(sitk.Cast(lesion_img, sitk.sitkUInt8), rigid_macro, sitk.Transform(), sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
+
+            # Targeted smart fill
+            filled_macro, target_mask_img = smart_fill_lesions_and_internal_holes(rigid_macro, lesion_img, pp_img)
+            filled_macro = sanitize_labels(filled_macro)
+            
+            # --- FINAL OUTPUT SAVED AS final_form.nii.gz ---
+            sitk.WriteImage(filled_macro, str(tf / "final_form.nii.gz"), useCompression=True)
+
+            dice_final = calculate_dice(pp_img, filled_macro)
+            print(f"      -> Script 3 (Smart Fill) Final Dice: {dice_final:.4f}")
+
+            # Generate Report on what was filled
+            macro_arr = sitk.GetArrayFromImage(filled_macro)
+            target_arr = sitk.GetArrayFromImage(target_mask_img)
+            t_mask = target_arr > 0
+            t_vox = int(np.count_nonzero(t_mask))
+            
+            with open(tf / "lesion_region_report.txt", "w") as f:
+                if t_vox > 0:
+                    labels, counts = np.unique(macro_arr[t_mask], return_counts=True)
+                    f.write(f"Total Voxels Filled (Lesion + Internal Gaps): {t_vox}\n\n")
+                    for lab, cnt in zip(labels, counts):
+                        name = REGION_INFO.get(int(lab), {}).get("name", f"Region_{lab}")
+                        f.write(f"Label {int(lab)} | {name} | Voxels: {int(cnt)} | %: {100.0 * cnt/t_vox:.4f}\n")
+                else:
+                    f.write("No missing voxels or lesions required filling.\n")
+
+            # Show final result on screen
+            show_alignment(pp_img, rigid_macro, filled_macro, subj_time, "Step 3: Smart Internal Fill", dice_s45, dice_final)
+
+            # --- CSV REPORTING ---
+            geom_comp = compare_geometry(pp_img, filled_macro)
+            inner_tx = final_tx.GetNthTransform(0) if isinstance(final_tx, sitk.CompositeTransform) else final_tx
+            if isinstance(inner_tx, sitk.Euler3DTransform):
+                ax, ay, az = np.degrees(inner_tx.GetAngleX()), np.degrees(inner_tx.GetAngleY()), np.degrees(inner_tx.GetAngleZ())
+                tx, ty, tz = inner_tx.GetTranslation()
+            else:
+                ax = ay = az = tx = ty = tz = ""
+
+            report_rows.append({
+                "folder": str(tf), "status": "OK", "metric_value": metric_val, "stop_condition": stop_cond,
+                "dice_orig": dice_orig, "dice_s4": dice_s4, "dice_s45": dice_s45, "dice_final": dice_final,
+                "same_size_after": geom_comp["same_size"], "same_spacing_after": geom_comp["same_spacing"],
+                "angle_x_deg": ax, "angle_y_deg": ay, "angle_z_deg": az, 
+                "translation_x": tx, "translation_y": ty, "translation_z": tz,
+                **geom_dict(pp_img, "pp"), **geom_dict(filled_macro, "aligned_macro")
+            })
+
+            pp_v, pp_mm, pp_ml = total_nonzero_volume(pp_img)
+            mac_v, mac_mm, mac_ml = total_nonzero_volume(filled_macro)
+            volume_rows.append({
+                "folder": str(tf), "pp_file": pp_path.name, "output_macro_file": "final_form.nii.gz",
+                "pp_nonzero_voxels": pp_v, "pp_volume_mL": pp_ml, "macro_nonzero_voxels": mac_v, "macro_volume_mL": mac_ml
+            })
+            
+            for row in per_label_volumes(filled_macro):
+                row["folder"] = str(tf)
+                label_rows.append(row)
+
+            patient_performance.append({
+                "tf": tf,
+                "subj_time": subj_time,
+                "dice_final": dice_final
+            })
+
+            ok += 1
+
+        except Exception as e:
+            print(f"[x] FAIL {subj_time}: {e}")
+            fail += 1
+
+    pd.DataFrame(report_rows).to_csv(ROOT / "resampled_brains_geometry_report.csv", index=False)
+    pd.DataFrame(volume_rows).to_csv(ROOT / "brain_volume_summary.csv", index=False)
+    pd.DataFrame(label_rows).to_csv(ROOT / "brain_volume_per_label.csv", index=False)
+
+    if patient_performance:
+        print("\n===================================================")
+        print("Analyzing edge cases for visual output...")
+        
+        sorted_performance = sorted(patient_performance, key=lambda x: x["dice_final"])
+        poorest = sorted_performance[0]
+        best = sorted_performance[-1]
+        
+        save_progression_plot(poorest["tf"], poorest["subj_time"], "Poorest", poorest["dice_final"], ROOT)
+        save_progression_plot(best["tf"], best["subj_time"], "Best", best["dice_final"], ROOT)
+
+    print("\n===================================================")
+    print(f"DONE. OK={ok} SKIP={skip} FAIL={fail}")
+    print("===================================================")
+
+if __name__ == "__main__":
+    main()
