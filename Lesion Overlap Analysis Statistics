@@ -1,0 +1,1392 @@
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import SimpleITK as sitk
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator, FormatStrFormatter
+import re
+import math
+
+
+ROOT = Path(r"C:\Users\chews\OneDrive\Desktop\New FYP\ALL SCENES")
+
+# All outputs will now be saved in the "Answers" folder inside ALL SCENES
+OUT = ROOT / "Answers"
+
+# --- DIRECTORY SETUP ---
+FIG_ESSENTIAL = OUT / "ESSENTIAL_GROWTH_DEVIATION"
+FIG_OTHER = OUT / "OTHER_STATIC_GRAPHS"
+IMPORTANT_CSVS = OUT / "important_csvs"
+
+OUT.mkdir(exist_ok=True)
+FIG_ESSENTIAL.mkdir(exist_ok=True)
+FIG_OTHER.mkdir(exist_ok=True)
+IMPORTANT_CSVS.mkdir(exist_ok=True)
+
+plt.rcParams.update({
+    "font.size": 18,
+    "axes.titlesize": 28,
+    "axes.titleweight": "bold",
+    "axes.labelsize": 24,
+    "axes.labelweight": "bold",
+    "xtick.labelsize": 18,
+    "ytick.labelsize": 24,
+    "legend.fontsize": 18,
+    "figure.titlesize": 42,
+    "figure.titleweight": "bold",
+})
+
+MACRO_LABEL_MAP = {
+    0: "Background",
+    1: "Basal Ganglia (Reward & Behaviour)",
+    2: "Cerebellum (Balance & Coordination)",
+    3: "Brainstem (Basic Life Function)",
+    4: "Ventricular System (CSF Spaces)",
+    5: "White Matter (Inter-regional Communication)",
+    6: "Frontal Lobe (Executive & Motor Functions)",
+    7: "Parietal Lobe (Somatosensory & Spatial Processing)",
+    8: "Temporal Lobe (Memory, Language & Auditory Processing)",
+    9: "Occipital Lobe (Visual Processing)",
+    10: "Insular & Cingulate Cortex (Perception, Emotion, Integration)",
+}
+
+DISPLAY_LABEL_MAP = {
+    "Background": "Background",
+    "Basal Ganglia (Reward & Behaviour)": "Basal\nGanglia",
+    "Cerebellum (Balance & Coordination)": "Cerebellum",
+    "Brainstem (Basic Life Function)": "Brainstem",
+    "Ventricular System (CSF Spaces)": "Ventricular\nSystem",
+    "White Matter (Inter-regional Communication)": "White\nMatter",
+    "Frontal Lobe (Executive & Motor Functions)": "Frontal\nLobe",
+    "Parietal Lobe (Somatosensory & Spatial Processing)": "Parietal\nLobe",
+    "Temporal Lobe (Memory, Language & Auditory Processing)": "Temporal\nLobe",
+    "Occipital Lobe (Visual Processing)": "Occipital\nLobe",
+    "Insular & Cingulate Cortex (Perception, Emotion, Integration)": "Insular &\nCingulate",
+    "Other / Unclassified Labels": "Other /\nUnclassified",
+}
+
+PLOT_REGION_ORDER = [
+    "Background",
+    "Basal Ganglia (Reward & Behaviour)",
+    "Cerebellum (Balance & Coordination)",
+    "Brainstem (Basic Life Function)",
+    "Ventricular System (CSF Spaces)",
+    "White Matter (Inter-regional Communication)",
+    "Frontal Lobe (Executive & Motor Functions)",
+    "Parietal Lobe (Somatosensory & Spatial Processing)",
+    "Temporal Lobe (Memory, Language & Auditory Processing)",
+    "Occipital Lobe (Visual Processing)",
+    "Insular & Cingulate Cortex (Perception, Emotion, Integration)",
+]
+
+RATERS = ["Expert_V1", "Expert_V2"]
+
+def pick_first(paths):
+    paths = sorted(list(paths))
+    return paths[0] if paths else None
+
+def find_macro(time_dir: Path):
+    cands = list(time_dir.rglob("resampled_fill.nii*"))
+    if not cands:
+        cands = list(time_dir.rglob("macro10.nii*"))
+    return pick_first(cands)
+
+def find_v1_v2_lesions(time_dir: Path):
+    cands = [
+        p for p in time_dir.rglob("*")
+        if p.is_file()
+        and "lesion" in p.name.lower()
+        and not p.name.endswith(".txt")
+    ]
+    v1 = [p for p in cands if "v1" in p.name.lower()]
+    v2 = [p for p in cands if "v2" in p.name.lower()]
+    return (pick_first(v1), pick_first(v2), cands)
+
+def load_img(p: Path):
+    try:
+        return sitk.ReadImage(str(p))
+    except Exception as e:
+        raise RuntimeError(f"FAILED to read: {p}\nReason: {e}")
+
+def get_subject_number(subject_name: str):
+    m = re.search(r"(\d+)", str(subject_name))
+    return int(m.group(1)) if m else None
+
+def get_split_from_subject(subject_name: str):
+    n = get_subject_number(subject_name)
+    if n is None:
+        return "UNKNOWN"
+    if 1 <= n <= 5:
+        return "TRAIN"
+    if 6 <= n <= 19:
+        return "TEST"
+    return "UNKNOWN"
+
+def short_label(name: str):
+    return DISPLAY_LABEL_MAP.get(name, name)
+
+def sort_subjects(subjects):
+    return sorted(subjects, key=lambda x: int(re.search(r"\d+", str(x)).group()))
+
+def match_grid(img_to_change, reference_img):
+    if (
+        img_to_change.GetSize() == reference_img.GetSize()
+        and img_to_change.GetSpacing() == reference_img.GetSpacing()
+        and img_to_change.GetOrigin() == reference_img.GetOrigin()
+        and img_to_change.GetDirection() == reference_img.GetDirection()
+    ):
+        return img_to_change
+
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetReferenceImage(reference_img)
+    resampler.SetInterpolator(sitk.sitkNearestNeighbor)
+    resampler.SetDefaultPixelValue(0)
+    resampler.SetTransform(sitk.Transform())
+    return resampler.Execute(img_to_change)
+
+def get_lesion_label_distribution(region_img, lesion_img):
+    R = sitk.GetArrayFromImage(region_img).astype(np.int32)
+    L = (sitk.GetArrayFromImage(lesion_img) > 0).astype(np.uint8)
+
+    lesion_labels, counts = np.unique(R[L == 1], return_counts=True)
+    total = int(counts.sum())
+
+    rows = []
+    for lab, c in zip(lesion_labels, counts):
+        if 0 <= int(lab) <= 10:
+            name = MACRO_LABEL_MAP[int(lab)]
+        else:
+            name = "Other / Unclassified Labels"
+
+        pct = (100.0 * int(c) / total) if total > 0 else 0.0
+
+        rows.append({
+            "label_value": int(lab),
+            "label_name": name,
+            "lesion_voxels": int(c),
+            "pct_of_total_lesion_voxels": pct,
+        })
+    return rows
+
+def compute_overlap_rows(region_img, lesion_img):
+    R = sitk.GetArrayFromImage(region_img).astype(np.int32)
+    L = (sitk.GetArrayFromImage(lesion_img) > 0).astype(np.uint8)
+
+    voxel_vol_mm3 = float(np.prod(region_img.GetSpacing()))
+    total_lesion_voxels = int(L.sum())
+    total_lesion_mm3 = float(total_lesion_voxels) * voxel_vol_mm3
+
+    rows = []
+
+    for label in range(0, 11):
+        region_mask = (R == label)
+        region_voxels = int(region_mask.sum())
+        region_mm3 = float(region_voxels) * voxel_vol_mm3
+
+        overlap_voxels = int(((L == 1) & region_mask).sum())
+        overlap_mm3 = float(overlap_voxels) * voxel_vol_mm3
+
+        pct_region_lesioned = (100.0 * overlap_mm3 / region_mm3) if region_mm3 > 0 else 0.0
+        pct_lesion_in_region = (100.0 * overlap_mm3 / total_lesion_mm3) if total_lesion_mm3 > 0 else 0.0
+
+        rows.append({
+            "region_label": label,
+            "region_name": MACRO_LABEL_MAP[label],
+            "region_voxels": region_voxels,
+            "region_vol_mm3": region_mm3,
+            "overlap_voxels": overlap_voxels,
+            "overlap_mm3": overlap_mm3,
+            "pct_region_lesioned": pct_region_lesioned,
+            "pct_lesion_in_region": pct_lesion_in_region,
+            "total_lesion_voxels": total_lesion_voxels,
+            "total_lesion_mm3": total_lesion_mm3,
+        })
+
+    valid_mask = np.isin(R, np.arange(0, 11))
+    other_mask = ~valid_mask
+
+    other_region_voxels = int(other_mask.sum())
+    other_region_mm3 = float(other_region_voxels) * voxel_vol_mm3
+
+    other_overlap_voxels = int(((L == 1) & other_mask).sum())
+    other_overlap_mm3 = float(other_overlap_voxels) * voxel_vol_mm3
+
+    pct_region_lesioned_other = (
+        100.0 * other_overlap_mm3 / other_region_mm3
+        if other_region_mm3 > 0 else 0.0
+    )
+    pct_lesion_in_region_other = (
+        100.0 * other_overlap_mm3 / total_lesion_mm3
+        if total_lesion_mm3 > 0 else 0.0
+    )
+
+    rows.append({
+        "region_label": -1,
+        "region_name": "Other / Unclassified Labels",
+        "region_voxels": other_region_voxels,
+        "region_vol_mm3": other_region_mm3,
+        "overlap_voxels": other_overlap_voxels,
+        "overlap_mm3": other_overlap_mm3,
+        "pct_region_lesioned": pct_region_lesioned_other,
+        "pct_lesion_in_region": pct_lesion_in_region_other,
+        "total_lesion_voxels": total_lesion_voxels,
+        "total_lesion_mm3": total_lesion_mm3,
+    })
+
+    return rows
+
+all_rows = []
+dice_rows = []
+label_dist_rows = []
+pct_check_rows = []
+
+subj_dirs = sorted([p for p in ROOT.iterdir() if p.is_dir() and p.name.upper().startswith("SUBJ")])
+print(f"Found {len(subj_dirs)} subject folders.")
+
+for subj_dir in subj_dirs:
+    split_name = get_split_from_subject(subj_dir.name)
+    time_dirs = sorted([p for p in subj_dir.iterdir() if p.is_dir() and p.name.lower().startswith("time")])
+
+    for time_dir in time_dirs:
+        macro_path = find_macro(time_dir)
+        if macro_path is None:
+            continue
+
+        v1_path, v2_path, lesion_like = find_v1_v2_lesions(time_dir)
+        if v1_path is None or v2_path is None:
+            continue
+
+        region_img = load_img(macro_path)
+        lesion1_img = load_img(v1_path)
+        lesion2_img = load_img(v2_path)
+
+        lesion1_img = match_grid(lesion1_img, region_img)
+        lesion2_img = match_grid(lesion2_img, region_img)
+
+        L1_arr = (sitk.GetArrayFromImage(lesion1_img) > 0).astype(np.uint8)
+        L2_arr = (sitk.GetArrayFromImage(lesion2_img) > 0).astype(np.uint8)
+
+        intersection = int(np.sum((L1_arr == 1) & (L2_arr == 1)))
+        sum_v1 = int(np.sum(L1_arr))
+        sum_v2 = int(np.sum(L2_arr))
+
+        if sum_v1 + sum_v2 == 0:
+            dice_score = 1.0
+        else:
+            dice_score = 2.0 * intersection / (sum_v1 + sum_v2)
+
+        dice_rows.append({
+            "subject": subj_dir.name,
+            "timepoint": time_dir.name,
+            "split": split_name,
+            "dice_v1_v2": round(dice_score, 4),
+            "v1_total_voxels": sum_v1,
+            "v2_total_voxels": sum_v2,
+        })
+
+        for rater, lesion_img, lesion_path in [
+            ("Expert_V1", lesion1_img, v1_path),
+            ("Expert_V2", lesion2_img, v2_path),
+        ]:
+            label_dist = get_lesion_label_distribution(region_img, lesion_img)
+            for row in label_dist:
+                row.update({
+                    "subject": subj_dir.name,
+                    "timepoint": time_dir.name,
+                    "split": split_name,
+                    "rater": rater,
+                    "macro_file": macro_path.name,
+                    "lesion_file": lesion_path.name,
+                })
+                label_dist_rows.append(row)
+
+            rows = compute_overlap_rows(region_img, lesion_img)
+
+            pct_sum = sum(row["pct_lesion_in_region"] for row in rows)
+            pct_check_rows.append({
+                "subject": subj_dir.name,
+                "timepoint": time_dir.name,
+                "split": split_name,
+                "rater": rater,
+                "macro_file": macro_path.name,
+                "lesion_file": lesion_path.name,
+                "sum_pct_lesion_in_region": pct_sum,
+                "difference_from_100": pct_sum - 100.0,
+                "passes_100_check": np.isclose(pct_sum, 100.0, atol=1e-6),
+            })
+
+            print(f"{subj_dir.name} | {time_dir.name} | {split_name} | {rater} -> sum pct_lesion_in_region = {pct_sum:.6f}%")
+
+            for row in rows:
+                row.update({
+                    "subject": subj_dir.name,
+                    "timepoint": time_dir.name,
+                    "split": split_name,
+                    "rater": rater,
+                    "macro_file": macro_path.name,
+                    "lesion_file": lesion_path.name,
+                })
+                all_rows.append(row)
+
+df = pd.DataFrame(all_rows)
+if df.empty:
+    raise SystemExit("\nNo rows computed. Check file naming or locations.\n")
+
+long_csv = OUT / "lesion_overlap_macro10_long.csv"
+df.to_csv(long_csv, index=False)
+print(f"\nSaved: {long_csv}")
+
+dice_df = pd.DataFrame(dice_rows)
+dice_csv = OUT / "lesion_inter_rater_dice.csv"
+dice_df.to_csv(dice_csv, index=False)
+print(f"Saved: {dice_csv}")
+
+label_dist_df = pd.DataFrame(label_dist_rows)
+label_dist_csv = OUT / "lesion_label_distribution_debug.csv"
+label_dist_df.to_csv(label_dist_csv, index=False)
+print(f"Saved: {label_dist_csv}")
+
+avg_dice = dice_df["dice_v1_v2"].mean()
+print(f"--> Average Inter-Rater Dice Score: {avg_dice:.3f}")
+
+summary = (
+    df.groupby(
+        ["subject", "timepoint", "split", "rater", "region_label", "region_name"],
+        as_index=False
+    )
+    .agg(
+        region_voxels=("region_voxels", "first"),
+        region_vol_mm3=("region_vol_mm3", "first"),
+        overlap_voxels=("overlap_voxels", "first"),
+        overlap_mm3=("overlap_mm3", "first"),
+        pct_region_lesioned=("pct_region_lesioned", "first"),
+        pct_lesion_in_region=("pct_lesion_in_region", "first"),
+        total_lesion_voxels=("total_lesion_voxels", "first"),
+        total_lesion_mm3=("total_lesion_mm3", "first"),
+    )
+)
+
+sum_csv = OUT / "lesion_overlap_macro10_summary_by_subject_time.csv"
+summary.to_csv(sum_csv, index=False)
+print(f"Saved: {sum_csv}")
+
+print("\nGenerating Figures...")
+
+def plot_subject_time(subj, tp, include_background=False):
+    d = df[(df["subject"] == subj) & (df["timepoint"] == tp)].copy()
+    if d.empty:
+        return
+
+    d = d[d["region_name"] != "Other / Unclassified Labels"].copy()
+
+    if not include_background:
+        d = d[d["region_name"] != "Background"].copy()
+
+    order = [x for x in PLOT_REGION_ORDER.copy() if x != "Other / Unclassified Labels"]
+    if not include_background:
+        order = [x for x in order if x != "Background"]
+
+    piv = d.pivot_table(
+        index="region_name",
+        columns="rater",
+        values="overlap_mm3",
+        aggfunc="first"
+    ).fillna(0)
+
+    piv = piv.reindex(order)
+
+    x = np.arange(len(piv.index))
+    w = 0.42
+    tick_labels = [short_label(x) for x in piv.index]
+
+    plt.figure(figsize=(24, 10))
+    plt.bar(x - w/2, piv.get("Expert_V1", 0), width=w, label="Expert V1", edgecolor="black")
+    plt.bar(x + w/2, piv.get("Expert_V2", 0), width=w, label="Expert V2", edgecolor="black")
+
+    plt.xticks(x, tick_labels, rotation=0, ha="center")
+    plt.title(f"{subj} {tp} — Lesion overlap per region", pad=24)
+    plt.ylabel("Lesion overlap\nvolume (mm³)", labelpad=15)
+    plt.xlabel("Brain region", labelpad=15)
+
+    plt.legend(frameon=False)
+    plt.grid(axis="y", linestyle="--", alpha=0.7)
+    plt.tight_layout(pad=2.0)
+
+    plt.savefig(FIG_OTHER / f"{subj}_{tp}_overlap_mm3_V1_vs_V2.png", dpi=300, bbox_inches="tight", pad_inches=0.2)
+    plt.close()
+
+def plot_stat_bar(stats_df, col, title, ylabel, outname, split_name, include_background=False):
+    if stats_df.empty:
+        return
+
+    d = stats_df.copy()
+
+    if not include_background:
+        d = d[d["SubRegion"] != "Background"].copy()
+
+    tick_labels = [short_label(x) for x in d["SubRegion"]]
+
+    if split_name == "TEST":
+        bar_color = "red"
+    elif split_name == "TRAIN":
+        bar_color = "blue"
+    else:
+        bar_color = "mediumpurple"
+
+    plt.figure(figsize=(24, 10))
+    plt.bar(np.arange(len(d)), d[col], color=bar_color, edgecolor="black")
+
+    plt.title(title, pad=24)
+    plt.ylabel(ylabel, labelpad=15)
+    plt.xlabel("Brain region", labelpad=15)
+    plt.xticks(np.arange(len(d)), tick_labels, rotation=0, ha="center")
+
+    plt.grid(axis="y", linestyle="--", alpha=0.7)
+    plt.tight_layout(pad=2.0)
+
+    plt.savefig(FIG_ESSENTIAL / outname, dpi=300, bbox_inches="tight", pad_inches=0.2)
+    plt.close()
+    print(f"Saved plot: {outname}")
+
+def plot_grouped_stat_bar(df_v1, df_v2, col, title, ylabel, outname, split_name, include_background=False):
+    if df_v1.empty or df_v2.empty:
+        return
+
+    d_v1 = df_v1.copy()
+    d_v2 = df_v2.copy()
+
+    if not include_background:
+        d_v1 = d_v1[d_v1["SubRegion"] != "Background"].copy()
+        d_v2 = d_v2[d_v2["SubRegion"] != "Background"].copy()
+
+    tick_labels = [short_label(x) for x in d_v1["SubRegion"]]
+    x = np.arange(len(d_v1))
+    w = 0.40
+
+    if split_name == "TEST":
+        c1, c2 = "firebrick", "lightcoral"
+    elif split_name == "TRAIN":
+        c1, c2 = "royalblue", "lightsteelblue"
+    else:
+        c1, c2 = "rebeccapurple", "thistle"
+
+    plt.figure(figsize=(24, 10))
+    plt.bar(x - w/2, d_v1[col], width=w, color=c1, edgecolor="black", label="Expert V1")
+    plt.bar(x + w/2, d_v2[col], width=w, color=c2, edgecolor="black", label="Expert V2")
+
+    plt.title(title, pad=24)
+    plt.ylabel(ylabel, labelpad=15)
+    plt.xlabel("Brain region", labelpad=15)
+    plt.xticks(x, tick_labels, rotation=0, ha="center")
+
+    plt.legend(frameon=False)
+    plt.grid(axis="y", linestyle="--", alpha=0.7)
+    plt.tight_layout(pad=2.0)
+
+    plt.savefig(FIG_ESSENTIAL / outname, dpi=300, bbox_inches="tight", pad_inches=0.2)
+    plt.close()
+    print(f"Saved grouped plot: {outname}")
+
+pairs = sorted(df[["subject", "timepoint"]].drop_duplicates().itertuples(index=False, name=None))
+for subj, tp in pairs:
+    plot_subject_time(subj, tp, include_background=False)
+
+for split_name in ["TRAIN", "TEST"]:
+    display_split = "Training" if split_name == "TRAIN" else "Testing"
+    for rater in RATERS:
+        d = df[(df["rater"] == rater) & (df["split"] == split_name)].copy()
+        d = d[(d["region_name"] != "Other / Unclassified Labels") & (d["region_name"] != "Background")].copy()
+
+        if d.empty:
+            continue
+
+        lesion_totals = (
+            d[["subject", "timepoint", "rater", "total_lesion_mm3"]]
+            .drop_duplicates()["total_lesion_mm3"]
+            .sum()
+        )
+
+        coh = d.groupby(["region_name"], as_index=False).agg(
+            overlap_sum=("overlap_mm3", "sum"),
+            region_sum=("region_vol_mm3", "sum"),
+        )
+
+        coh["pct_lesion_in_region_weighted"] = np.where(
+            lesion_totals > 0,
+            100 * coh["overlap_sum"] / lesion_totals,
+            0
+        )
+        coh["pct_region_lesioned_weighted"] = np.where(
+            coh["region_sum"] > 0,
+            100 * coh["overlap_sum"] / coh["region_sum"],
+            0
+        )
+
+        order = [x for x in PLOT_REGION_ORDER.copy() if (x != "Other / Unclassified Labels" and x != "Background")]
+        coh = coh.set_index("region_name").reindex(order).reset_index()
+        tick_labels = [short_label(x) for x in coh["region_name"]]
+        bar_color = "red" if split_name == "TEST" else "blue"
+
+        # SAVE + PRINT EXACT STATIC BAR-CHART VALUES FOR INDIVIDUAL RATERS
+        static_values_df = coh[[
+            "region_name",
+            "overlap_sum",
+            "region_sum",
+            "pct_lesion_in_region_weighted",
+            "pct_region_lesioned_weighted",
+        ]].copy()
+
+        static_values_df = static_values_df.rename(columns={
+            "region_name": "Brain_Region",
+            "overlap_sum": "Total_Overlap_mm3",
+            "region_sum": "Total_Region_mm3",
+            "pct_lesion_in_region_weighted": "Static_Lesion_Distribution_Percent",
+            "pct_region_lesioned_weighted": "Static_Regional_Burden_Percent",
+        })
+
+        static_csv_path = IMPORTANT_CSVS / f"static_bar_chart_values_{split_name}_{rater}.csv"
+        static_values_df.to_csv(static_csv_path, index=False)
+
+        print(f"\n{'='*90}")
+        print(f"STATIC BAR-CHART VALUES ({split_name} - {rater})")
+        print(f"{'='*90}")
+        print(static_values_df.to_string(index=False))
+        print(f"Saved static bar-chart values to: {static_csv_path.name}")
+        print(f"{'='*90}\n")
+
+        plt.figure(figsize=(24, 10))
+        plt.bar(np.arange(len(coh)), coh["pct_lesion_in_region_weighted"].values,
+                color=bar_color, edgecolor="black")
+
+        plt.xticks(np.arange(len(coh)), tick_labels, rotation=0, ha="center")
+        plt.ylabel("% of total lesion\nvolume in region", labelpad=15)
+        plt.xlabel("Brain region", labelpad=15)
+        plt.title(f"Cohort Lesion Distribution Across Regions ({display_split} Set - {rater})", pad=24)
+        plt.tight_layout(pad=2.0)
+
+        out_dist = FIG_OTHER / f"cohort_weighted_lesion_distribution_{split_name}_{rater}.png"
+        plt.savefig(out_dist, dpi=300, bbox_inches="tight", pad_inches=0.2)
+        plt.close()
+
+        plt.figure(figsize=(24, 10))
+        plt.bar(np.arange(len(coh)), coh["pct_region_lesioned_weighted"].values,
+                color=bar_color, edgecolor="black")
+
+        plt.xticks(np.arange(len(coh)), tick_labels, rotation=0, ha="center")
+        plt.ylabel("% of region\nvolume lesioned", labelpad=15)
+        plt.xlabel("Brain region", labelpad=15)
+        plt.title(f"Cohort Regional Burden Across Regions ({display_split} Set - {rater})", pad=24)
+        plt.tight_layout(pad=2.0)
+
+        out_burden = FIG_OTHER / f"cohort_weighted_regional_burden_{split_name}_{rater}.png"
+        plt.savefig(out_burden, dpi=300, bbox_inches="tight", pad_inches=0.2)
+        plt.close()
+
+print("\nGenerating Combined Raters (Average) Cohort Figures...")
+df_combined = df[(df["region_name"] != "Other / Unclassified Labels") & (df["region_name"] != "Background")].copy()
+
+df_avg = df_combined.groupby(
+    ["subject", "timepoint", "split", "region_name"], as_index=False
+).agg(
+    overlap_mm3=("overlap_mm3", "mean"),
+    overlap_voxels=("overlap_voxels", "mean"),
+    region_vol_mm3=("region_vol_mm3", "first"),
+    total_lesion_mm3=("total_lesion_mm3", "mean")
+)
+
+for split_name in ["TRAIN", "TEST", "WHOLE_COHORT"]:
+
+    if split_name == "WHOLE_COHORT":
+        display_split = "Whole Cohort (Train + Test)"
+        d_split = df_avg.copy()
+        bar_color = "mediumpurple"
+    else:
+        display_split = "Training" if split_name == "TRAIN" else "Testing"
+        d_split = df_avg[df_avg["split"] == split_name].copy()
+        bar_color = "red" if split_name == "TEST" else "blue"
+
+    if d_split.empty:
+        continue
+
+    lesion_totals = (
+        d_split[["subject", "timepoint", "total_lesion_mm3"]]
+        .drop_duplicates()["total_lesion_mm3"]
+        .sum()
+    )
+
+    coh = d_split.groupby(["region_name"], as_index=False).agg(
+        overlap_sum=("overlap_mm3", "sum"),
+        overlap_voxels_sum=("overlap_voxels", "sum"),
+        region_sum=("region_vol_mm3", "sum")
+    )
+
+    coh["pct_lesion_in_region_weighted"] = np.where(
+        lesion_totals > 0,
+        100 * coh["overlap_sum"] / lesion_totals,
+        0
+    )
+
+    coh["pct_region_lesioned_weighted"] = np.where(
+        coh["region_sum"] > 0,
+        100 * coh["overlap_sum"] / coh["region_sum"],
+        0
+    )
+
+    order = [x for x in PLOT_REGION_ORDER.copy() if (x != "Other / Unclassified Labels" and x != "Background")]
+    coh = coh.set_index("region_name").reindex(order).reset_index()
+    tick_labels = [short_label(x) for x in coh["region_name"]]
+
+    # SAVE + PRINT EXACT STATIC BAR-CHART VALUES
+    static_values_df = coh[[
+        "region_name",
+        "overlap_sum",
+        "overlap_voxels_sum",
+        "region_sum",
+        "pct_lesion_in_region_weighted",
+        "pct_region_lesioned_weighted",
+    ]].copy()
+
+    static_values_df = static_values_df.rename(columns={
+        "region_name": "Brain_Region",
+        "overlap_sum": "Total_Overlap_mm3",
+        "overlap_voxels_sum": "Total_Overlap_Voxels",
+        "region_sum": "Total_Region_mm3",
+        "pct_lesion_in_region_weighted": "Static_Lesion_Distribution_Percent",
+        "pct_region_lesioned_weighted": "Static_Regional_Burden_Percent",
+    })
+
+    static_csv_path = IMPORTANT_CSVS / f"static_bar_chart_values_{split_name}_Combined.csv"
+    static_values_df.to_csv(static_csv_path, index=False)
+
+    print(f"\n{'='*90}")
+    print(f"STATIC BAR-CHART VALUES ({split_name})")
+    print(f"{'='*90}")
+    print(static_values_df.to_string(index=False))
+    print(f"Saved static bar-chart values to: {static_csv_path.name}")
+    print(f"{'='*90}\n")
+
+    plt.figure(figsize=(24, 10))
+    plt.bar(np.arange(len(coh)), coh["pct_lesion_in_region_weighted"].values,
+            color=bar_color, edgecolor="black")
+
+    plt.xticks(np.arange(len(coh)), tick_labels, rotation=0, ha="center")
+    plt.ylabel("Average Lesion\nPercentage (%)", labelpad=15)
+    plt.xlabel("Brain Macro-region", labelpad=15)
+    plt.title(f"Average Cohort Lesion Distribution ({display_split} Set)", pad=24)
+    plt.tight_layout(pad=2.0)
+
+    out_dist_comb = FIG_OTHER / f"cohort_weighted_lesion_distribution_{split_name}_Combined.png"
+    plt.savefig(out_dist_comb, dpi=300, bbox_inches="tight", pad_inches=0.2)
+    plt.close()
+
+    plt.figure(figsize=(24, 10))
+    plt.bar(np.arange(len(coh)), coh["pct_region_lesioned_weighted"].values,
+            color=bar_color, edgecolor="black")
+
+    plt.xticks(np.arange(len(coh)), tick_labels, rotation=0, ha="center")
+    plt.ylabel("Average Brain Region\nLesioned (%)", labelpad=15)
+    plt.xlabel("Brain Macro-region", labelpad=15)
+    plt.title(f"Average Regional Burden ({display_split} Set)", pad=24)
+    plt.tight_layout(pad=2.0)
+
+    out_burden_comb = FIG_OTHER / f"cohort_weighted_regional_burden_{split_name}_Combined.png"
+    plt.savefig(out_burden_comb, dpi=300, bbox_inches="tight", pad_inches=0.2)
+    plt.close()
+
+    plt.figure(figsize=(24, 10))
+    plt.bar(np.arange(len(coh)), coh["overlap_sum"].values,
+            color=bar_color, edgecolor="black")
+
+    plt.xticks(np.arange(len(coh)), tick_labels, rotation=0, ha="center")
+    plt.ylabel("Total Lesion Overlap\nVolume (mm³)", labelpad=15)
+    plt.xlabel("Brain Macro-region", labelpad=15)
+    plt.title(f"Average Absolute Regional Lesion Volume ({display_split} Set)", pad=24)
+    plt.tight_layout(pad=2.0)
+
+    out_abs_comb = FIG_OTHER / f"cohort_absolute_volume_{split_name}_Combined.png"
+    plt.savefig(out_abs_comb, dpi=300, bbox_inches="tight", pad_inches=0.2)
+    plt.close()
+
+print("\nGenerating longitudinal lesion statistics and plots...")
+
+df_long = summary.copy()
+df_long["Scan_Number"] = df_long["timepoint"].apply(
+    lambda x: int(re.search(r"\d+", str(x)).group())
+)
+
+# Build the Consensus Dataframe
+df_long_consensus = df_long.groupby(
+    ["subject", "Scan_Number", "split", "region_name"], as_index=False
+).agg({"overlap_mm3": "mean"})
+
+def compute_longitudinal_stats(df_source, split_name, rater_name=None):
+    if split_name == "WHOLE_COHORT":
+        d = df_source.copy()
+    else:
+        d = df_source[df_source["split"] == split_name].copy()
+
+    if rater_name is not None and "rater" in d.columns:
+        d = d[d["rater"] == rater_name].copy()
+
+    region_stats = []
+
+    for region in PLOT_REGION_ORDER:
+        reg_data = d[d["region_name"] == region].copy()
+        if reg_data.empty:
+            continue
+
+        patient_first_last_abs = []
+        patient_first_last_pct = []
+
+        abs_num, abs_den, pct_num, pct_den = 0.0, 0.0, 0.0, 0.0
+
+        for subj in sort_subjects(reg_data["subject"].unique()):
+            subj_data = reg_data[reg_data["subject"] == subj].sort_values("Scan_Number").copy()
+            n_i = len(subj_data)
+            if n_i < 2:
+                continue
+
+            vols = subj_data["overlap_mm3"].to_numpy(dtype=float)
+            v_first = vols[0]
+            v_last = vols[-1]
+
+            patient_first_last_abs.append(v_last - v_first)
+
+            if v_first > 0:
+                patient_first_last_pct.append(((v_last - v_first) / v_first) * 100.0)
+
+            if n_i >= 3:
+                delta_abs = np.diff(vols)
+                if len(delta_abs) >= 2:
+                    s_abs_i = np.std(delta_abs, ddof=1)
+                    w = n_i - 2
+                    abs_num += w * (s_abs_i ** 2)
+                    abs_den += w
+
+            if n_i >= 3:
+                delta_pct = []
+                for j in range(len(vols) - 1):
+                    if vols[j] > 0:
+                        delta_pct.append(100.0 * (vols[j + 1] - vols[j]) / vols[j])
+
+                if len(delta_pct) >= 2:
+                    s_pct_i = np.std(delta_pct, ddof=1)
+                    w = n_i - 2
+                    pct_num += w * (s_pct_i ** 2)
+                    pct_den += w
+
+        region_stats.append({
+            "SubRegion": region,
+            "MD_abs": np.mean(patient_first_last_abs) if patient_first_last_abs else 0.0,
+            "MD_pct": np.mean(patient_first_last_pct) if patient_first_last_pct else 0.0,
+            "SD_pooled_abs": np.sqrt(abs_num / abs_den) if abs_den > 0 else 0.0,
+            "SD_pooled_pct": np.sqrt(pct_num / pct_den) if pct_den > 0 else 0.0,
+            "N_subjects_first_last_abs": len(patient_first_last_abs),
+            "N_subjects_first_last_pct": len(patient_first_last_pct),
+        })
+
+    stats_df = pd.DataFrame(region_stats)
+    if not stats_df.empty:
+        stats_df = stats_df.set_index("SubRegion").reindex(PLOT_REGION_ORDER).reset_index()
+
+    return stats_df
+
+# Generate Consensus Longitudinal Stats
+for split_name in ["TRAIN", "TEST", "WHOLE_COHORT"]:
+    if split_name == "WHOLE_COHORT":
+        display_split = "Whole Cohort (Train + Test)"
+    else:
+        display_split = "Training" if split_name == "TRAIN" else "Testing"
+
+    stats_df = compute_longitudinal_stats(df_long_consensus, split_name, rater_name=None)
+    stats_csv = IMPORTANT_CSVS / f"longitudinal_lesion_region_statistics_Consensus_{split_name}.csv"
+    stats_df.to_csv(stats_csv, index=False)
+
+    print(f"\n" + "="*90)
+    print(f" FINAL STATISTICAL RESULTS (CONSENSUS DATA): {display_split.upper()}")
+    print("="*90)
+    print(stats_df.to_string(index=False))
+    print("="*90 + "\n")
+
+    plot_stat_bar(stats_df, "MD_abs", f"Mean Absolute Lesion Volume Change ($MD_{{abs}}$) - {display_split}", "Mean change in\nlesion volume (mm$^3$)", f"BarChart_MD_abs_Consensus_{split_name}.png", split_name, include_background=False)
+    plot_stat_bar(stats_df, "MD_pct", f"Mean Percentage Lesion Volume Change ($MD_{{\\%}}$) - {display_split}", "Mean percentage\nchange (%)", f"BarChart_MD_pct_Consensus_{split_name}.png", split_name, include_background=False)
+    plot_stat_bar(stats_df, "SD_pooled_abs", f"Pooled SD of Consecutive Absolute Volume Change - {display_split}", "Pooled SD of\nconsecutive changes (mm$^3$)", f"BarChart_SD_pooled_abs_Consensus_{split_name}.png", split_name, include_background=False)
+    plot_stat_bar(stats_df, "SD_pooled_pct", f"Pooled SD of Consecutive Percentage Volume Change - {display_split}", "Pooled SD of consecutive\npercentage changes (%)", f"BarChart_SD_pooled_pct_Consensus_{split_name}.png", split_name, include_background=False)
+
+for split_name in ["TRAIN", "TEST", "WHOLE_COHORT"]:
+    if split_name == "WHOLE_COHORT":
+        display_split = "Whole Cohort"
+    else:
+        display_split = "Training" if split_name == "TRAIN" else "Testing"
+
+    stats_v1 = compute_longitudinal_stats(df_long, split_name, rater_name="Expert_V1")
+    stats_v2 = compute_longitudinal_stats(df_long, split_name, rater_name="Expert_V2")
+
+    if not stats_v1.empty:
+        stats_v1.to_csv(IMPORTANT_CSVS / f"longitudinal_lesion_region_statistics_{split_name}_Expert_V1.csv", index=False)
+    if not stats_v2.empty:
+        stats_v2.to_csv(IMPORTANT_CSVS / f"longitudinal_lesion_region_statistics_{split_name}_Expert_V2.csv", index=False)
+
+    if split_name != "WHOLE_COHORT":
+        plot_grouped_stat_bar(stats_v1, stats_v2, "MD_abs", f"Mean Absolute Lesion Volume Change ($MD_{{abs}}$)\n{display_split} Set (Both Experts)", "Mean change in\nlesion volume (mm$^3$)", f"BarChart_MD_abs_{split_name}_Grouped_Raters.png", split_name, include_background=False)
+        plot_grouped_stat_bar(stats_v1, stats_v2, "MD_pct", f"Mean Percentage Lesion Volume Change ($MD_{{\\%}}$)\n{display_split} Set (Both Experts)", "Mean percentage\nchange (%)", f"BarChart_MD_pct_{split_name}_Grouped_Raters.png", split_name, include_background=False)
+        plot_grouped_stat_bar(stats_v1, stats_v2, "SD_pooled_abs", f"Pooled SD of Consecutive Absolute Lesion Volume Change\n{display_split} Set (Both Experts)", "Pooled SD of\nconsecutive changes (mm$^3$)", f"BarChart_SD_pooled_abs_{split_name}_Grouped_Raters.png", split_name, include_background=False)
+        plot_grouped_stat_bar(stats_v1, stats_v2, "SD_pooled_pct", f"Pooled SD of Consecutive Percentage Lesion Volume Change\n{display_split} Set (Both Experts)", "Pooled SD of consecutive\npercentage changes (%)", f"BarChart_SD_pooled_pct_{split_name}_Grouped_Raters.png", split_name, include_background=False)
+
+print("\nCalculating Inter-Rater Volume Differences (V1 vs V2)...")
+
+df_rater_diff = summary.pivot_table(
+    index=["subject", "timepoint", "split", "region_name"],
+    columns="rater",
+    values="overlap_mm3",
+    aggfunc="first"
+).reset_index()
+
+df_rater_diff["Expert_V1"] = df_rater_diff.get("Expert_V1", 0).fillna(0)
+df_rater_diff["Expert_V2"] = df_rater_diff.get("Expert_V2", 0).fillna(0)
+
+df_rater_diff["Difference_V1_minus_V2"] = df_rater_diff["Expert_V1"] - df_rater_diff["Expert_V2"]
+df_rater_diff["Absolute_Difference"] = df_rater_diff["Difference_V1_minus_V2"].abs()
+
+rater_diff_csv = IMPORTANT_CSVS / "inter_rater_volume_differences_mm3.csv"
+df_rater_diff.to_csv(rater_diff_csv, index=False)
+print(f"Saved exact Inter-Rater Differences to: {rater_diff_csv.name}")
+
+def plot_rater_diff_bar(df_diff, split_name, display_split, outname):
+    if split_name == "WHOLE_COHORT":
+        d = df_diff.copy()
+        bar_color = "mediumpurple"
+    else:
+        d = df_diff[df_diff["split"] == split_name].copy()
+        bar_color = "red" if split_name == "TEST" else "blue"
+
+    if d.empty:
+        return
+
+    d = d[(d["region_name"] != "Background") & (d["region_name"] != "Other / Unclassified Labels")]
+    agg_diff = d.groupby("region_name")["Absolute_Difference"].mean().reset_index()
+
+    order = [x for x in PLOT_REGION_ORDER if (x != "Other / Unclassified Labels" and x != "Background")]
+    agg_diff = agg_diff.set_index("region_name").reindex(order).reset_index()
+    agg_diff["Absolute_Difference"] = agg_diff["Absolute_Difference"].fillna(0)
+
+    tick_labels = [short_label(x) for x in agg_diff["region_name"]]
+
+    plt.figure(figsize=(24, 10))
+    plt.bar(np.arange(len(agg_diff)), agg_diff["Absolute_Difference"], color=bar_color, edgecolor="black")
+
+    plt.title(f"Mean Absolute Inter-Rater Disagreement (|V1 - V2|) - {display_split}", pad=24)
+    plt.ylabel("Mean Absolute\nDifference (mm³)", labelpad=15)
+    plt.xlabel("Brain Macro-region", labelpad=15)
+    plt.xticks(np.arange(len(agg_diff)), tick_labels, rotation=0, ha="center")
+    plt.grid(axis="y", linestyle="--", alpha=0.7)
+    plt.tight_layout(pad=2.0)
+
+    plt.savefig(FIG_ESSENTIAL / outname, dpi=300, bbox_inches="tight", pad_inches=0.2)
+    plt.close()
+    print(f"Saved rater difference plot: {outname}")
+
+plot_rater_diff_bar(df_rater_diff, "TRAIN", "Training Set", "BarChart_InterRater_Diff_TRAIN.png")
+plot_rater_diff_bar(df_rater_diff, "TEST", "Testing Set", "BarChart_InterRater_Diff_TEST.png")
+plot_rater_diff_bar(df_rater_diff, "WHOLE_COHORT", "Whole Cohort", "BarChart_InterRater_Diff_WHOLE_COHORT.png")
+
+
+def plot_linegraphs(df_source, split_name, display_split, rater_name, title, outname):
+    if split_name == "WHOLE_COHORT":
+        d = df_source.copy()
+    else:
+        d = df_source[df_source["split"] == split_name].copy()
+
+    if rater_name:
+        d = d[d["rater"] == rater_name].copy()
+
+    if d.empty:
+        return
+
+    region_fluctuations = d.groupby("region_name")["overlap_mm3"].std().fillna(0).sort_values(ascending=False)
+    sorted_regions = [r for r in region_fluctuations.index.tolist() if (r in PLOT_REGION_ORDER and r != "Background")]
+
+    n_regions = len(sorted_regions)
+    ncols = 2
+    nrows = math.ceil(n_regions / ncols)
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(28, 10.0 * nrows), sharex=False)
+    axes = np.array(axes).reshape(-1)
+
+    subjects = sort_subjects(d["subject"].unique())
+    colors = plt.cm.tab20(np.linspace(0, 1, len(subjects)))
+    subj_color_map = dict(zip(subjects, colors))
+
+    col_major_indices = []
+    for col in range(ncols):
+        for row in range(nrows):
+            idx = row * ncols + col
+            if idx < len(axes):
+                col_major_indices.append(idx)
+
+    plotted_axes = []
+
+    global_scan_min = int(d["Scan_Number"].min())
+    global_scan_max = int(d["Scan_Number"].max())
+    xticks_int = list(range(global_scan_min, global_scan_max + 1))
+
+    for i, region in enumerate(sorted_regions):
+        ax_idx = col_major_indices[i]
+        ax = axes[ax_idx]
+        plotted_axes.append(ax_idx)
+
+        reg_data = d[d["region_name"] == region].copy()
+
+        for subj in subjects:
+            c = subj_color_map[subj]
+            raters_to_plot = [rater_name] if rater_name else RATERS
+
+            for rater in raters_to_plot:
+                subset = reg_data[(reg_data["subject"] == subj) & (reg_data["rater"] == rater)].sort_values("Scan_Number")
+                if subset.empty:
+                    continue
+
+                if not rater_name:
+                    ls = '-' if rater == "Expert_V1" else '--'
+                    m = 'o' if rater == "Expert_V1" else 'x'
+                    lbl = f"{subj} ({rater[-2:]})"
+                else:
+                    ls = '-'
+                    m = 'o'
+                    lbl = subj
+
+                ax.plot(
+                    subset["Scan_Number"],
+                    subset["overlap_mm3"],
+                    linestyle=ls,
+                    marker=m,
+                    color=c,
+                    alpha=0.75,
+                    linewidth=2.5,
+                    markersize=10,
+                    label=lbl
+                )
+
+        ax.set_title(short_label(region).replace('\n', ' '), pad=24)
+        ax.set_xlabel("Scan number", labelpad=15)
+        ax.set_ylabel("Lesion volume\n(mm$^3$)", labelpad=15)
+        ax.tick_params(axis="x", labelsize=24)
+        ax.tick_params(axis="y", labelsize=24)
+        ax.grid(True, linestyle="--", alpha=0.4)
+
+        ax.set_xticks(xticks_int)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.xaxis.set_major_formatter(FormatStrFormatter('%d'))
+
+    for k in range(len(axes)):
+        if k not in plotted_axes:
+            fig.delaxes(axes[k])
+
+    plt.suptitle(title, fontsize=42, fontweight="bold", y=0.995)
+
+    handles, labels = [], []
+    seen = set()
+    for ax_idx in plotted_axes:
+        h, l = axes[ax_idx].get_legend_handles_labels()
+        for hh, ll in zip(h, l):
+            if ll not in seen:
+                handles.append(hh)
+                labels.append(ll)
+                seen.add(ll)
+
+    if handles:
+        ncol_legend = 5 if len(labels) >= 10 else max(1, len(labels))
+        fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.975), ncol=ncol_legend)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96], pad=3.0)
+    plt.savefig(FIG_ESSENTIAL / outname, dpi=300, bbox_inches="tight", pad_inches=0.2)
+    plt.close()
+    print(f"Saved plot: {outname}")
+
+for split_name in ["TRAIN", "TEST"]:
+    display_split = "Training" if split_name == "TRAIN" else "Testing"
+    for rater in RATERS:
+        plot_linegraphs(
+            df_long,
+            split_name,
+            display_split,
+            rater,
+            f"Longitudinal Lesion Volume by Region ({display_split} Set - {rater})",
+            f"LineGraphs_{split_name}_{rater}.png"
+        )
+
+for split_name in ["TRAIN", "TEST"]:
+    display_split = "Training" if split_name == "TRAIN" else "Testing"
+    plot_linegraphs(
+        df_long,
+        split_name,
+        display_split,
+        None,
+        f"Longitudinal Lesion Volume by Region ({display_split} Set - Both Experts)",
+        f"LineGraphs_{split_name}_Combined_Raters.png"
+    )
+
+plot_linegraphs(
+    df_long,
+    "WHOLE_COHORT",
+    "Whole Cohort",
+    None,
+    "Longitudinal Lesion Volume by Region (Whole Cohort - Both Experts)",
+    "LineGraphs_WHOLE_COHORT_Combined_Raters.png"
+)
+
+plot_linegraphs(
+    df_long,
+    "WHOLE_COHORT",
+    "Whole Cohort",
+    "Expert_V1",
+    "Longitudinal Lesion Volume by Region (Whole Cohort - Expert_V1)",
+    "LineGraphs_WHOLE_COHORT_Expert_V1.png"
+)
+
+plot_linegraphs(
+    df_long,
+    "WHOLE_COHORT",
+    "Whole Cohort",
+    "Expert_V2",
+    "Longitudinal Lesion Volume by Region (Whole Cohort - Expert_V2)",
+    "LineGraphs_WHOLE_COHORT_Expert_V2.png"
+)
+
+print("\n" + "="*80)
+print(" CALCULATING DATA FOR 'LESION VOLUME ANALYSIS' TABLE & TOTAL BRAIN PERCENTAGES")
+print("="*80)
+
+df_total_consensus = df_long.groupby(
+    ["subject", "Scan_Number", "split"], as_index=False
+).agg({"total_lesion_mm3": "mean"})
+
+def compute_total_lesion_stats(df_source, split_name):
+    d = df_source.copy() if split_name == "WHOLE_COHORT" else df_source[df_source["split"] == split_name].copy()
+    if d.empty:
+        return None
+
+    patient_v_first = []
+    patient_v_last = []
+    patient_first_last_abs = []
+    patient_first_last_pct = []
+
+    abs_num, abs_den, pct_num, pct_den = 0.0, 0.0, 0.0, 0.0
+
+    for subj in sort_subjects(d["subject"].unique()):
+        subj_data = d[d["subject"] == subj].sort_values("Scan_Number").copy()
+        n_i = len(subj_data)
+        if n_i < 2:
+            continue
+
+        vols = subj_data["total_lesion_mm3"].to_numpy(dtype=float)
+        v_first = vols[0]
+        v_last = vols[-1]
+
+        patient_v_first.append(v_first)
+        patient_v_last.append(v_last)
+
+        patient_first_last_abs.append(v_last - v_first)
+        if v_first > 0:
+            patient_first_last_pct.append(((v_last - v_first) / v_first) * 100.0)
+
+        if n_i >= 3:
+            delta_abs = np.diff(vols)
+            if len(delta_abs) >= 2:
+                s_abs_i = np.std(delta_abs, ddof=1)
+                w = n_i - 2
+                abs_num += w * (s_abs_i ** 2)
+                abs_den += w
+
+            delta_pct = []
+            for j in range(len(vols) - 1):
+                if vols[j] > 0:
+                    delta_pct.append(100.0 * (vols[j + 1] - vols[j]) / vols[j])
+
+            if len(delta_pct) >= 2:
+                s_pct_i = np.std(delta_pct, ddof=1)
+                w = n_i - 2
+                pct_num += w * (s_pct_i ** 2)
+                pct_den += w
+
+    return {
+        "Metric": [
+            "Initial Volume (Vi)",
+            "Final Volume (Vf)",
+            "Mean Abs Change (MD_abs)",
+            "Mean Pct Change (MD_%)",
+            "Pooled SD Abs (SD_pooled_abs)",
+            "Pooled SD Pct (SD_pooled_%)"
+        ],
+        split_name: [
+            round(np.mean(patient_v_first), 2) if patient_v_first else 0.0,
+            round(np.mean(patient_v_last), 2) if patient_v_last else 0.0,
+            round(np.mean(patient_first_last_abs), 2) if patient_first_last_abs else 0.0,
+            round(np.mean(patient_first_last_pct), 2) if patient_first_last_pct else 0.0,
+            round(np.sqrt(abs_num / abs_den), 2) if abs_den > 0 else 0.0,
+            round(np.sqrt(pct_num / pct_den), 2) if pct_den > 0 else 0.0
+        ]
+    }
+
+train_totals = compute_total_lesion_stats(df_total_consensus, "TRAIN")
+test_totals = compute_total_lesion_stats(df_total_consensus, "TEST")
+
+if train_totals and test_totals:
+    table_df = pd.DataFrame({
+        "Volume Metrics": train_totals["Metric"],
+        "Training Set (n=5)": train_totals["TRAIN"],
+        "Testing Set (n=14)": test_totals["TEST"]
+    })
+    print(table_df.to_string(index=False))
+
+print("\n" + "="*80)
+print(" TOTAL BRAIN LESION PERCENTAGE & ABSOLUTE VOLUME")
+print("="*80)
+
+valid_brain_regions = [r for r in df_long["region_name"].unique() if (r != "Background" and r != "Other / Unclassified Labels")]
+
+df_brain = df_long[df_long["region_name"].isin(valid_brain_regions)].groupby(
+    ["subject", "timepoint", "split", "Scan_Number"], as_index=False
+).agg(
+    total_brain_vol=("region_vol_mm3", "sum"),
+    total_lesion_vol=("total_lesion_mm3", "first")
+)
+
+df_brain["pct_brain_lesioned"] = (df_brain["total_lesion_vol"] / df_brain["total_brain_vol"]) * 100
+
+for split_name in ["TRAIN", "TEST"]:
+    d_split = df_brain[df_brain["split"] == split_name]
+    if not d_split.empty:
+        mean_abs = d_split["total_lesion_vol"].mean()
+        mean_pct = d_split["pct_brain_lesioned"].mean()
+        print(f"{split_name} SET:")
+        print(f"  - Mean Absolute Lesion Volume: {mean_abs:.2f} mm³")
+        print(f"  - Mean Percentage of Brain Lesioned: {mean_pct:.4f} %")
+print("="*80 + "\n")
+
+print("Generating Consensus Line Graphs...")
+
+def plot_consensus_linegraphs(df_source, split_name, display_split, outname):
+    if split_name == "WHOLE_COHORT":
+        d = df_source.copy()
+    else:
+        d = df_source[df_source["split"] == split_name].copy()
+
+    if d.empty:
+        return
+
+    region_fluctuations = d.groupby("region_name")["overlap_mm3"].std().fillna(0).sort_values(ascending=False)
+    sorted_regions = [r for r in region_fluctuations.index.tolist() if (r in PLOT_REGION_ORDER and r != "Background")]
+
+    n_regions = len(sorted_regions)
+    ncols = 2
+    nrows = math.ceil(n_regions / ncols)
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(28, 10.0 * nrows), sharex=False)
+    axes = np.array(axes).reshape(-1)
+
+    subjects = sort_subjects(d["subject"].unique())
+    colors = plt.cm.tab20(np.linspace(0, 1, len(subjects)))
+    subj_color_map = dict(zip(subjects, colors))
+
+    col_major_indices = []
+    for col in range(ncols):
+        for row in range(nrows):
+            idx = row * ncols + col
+            if idx < len(axes):
+                col_major_indices.append(idx)
+
+    plotted_axes = []
+
+    global_scan_min = int(d["Scan_Number"].min())
+    global_scan_max = int(d["Scan_Number"].max())
+    xticks_int = list(range(global_scan_min, global_scan_max + 1))
+
+    for i, region in enumerate(sorted_regions):
+        ax_idx = col_major_indices[i]
+        ax = axes[ax_idx]
+        plotted_axes.append(ax_idx)
+
+        reg_data = d[d["region_name"] == region].copy()
+
+        for subj in subjects:
+            subset = reg_data[reg_data["subject"] == subj].sort_values("Scan_Number")
+            if subset.empty:
+                continue
+
+            ax.plot(
+                subset["Scan_Number"],
+                subset["overlap_mm3"],
+                linestyle='-',
+                marker='o',
+                color=subj_color_map[subj],
+                alpha=0.8,
+                linewidth=3.0,
+                markersize=10,
+                label=subj
+            )
+
+        ax.set_title(short_label(region).replace('\n', ' '), pad=24)
+        ax.set_xlabel("Scan number", labelpad=15)
+        ax.set_ylabel("Lesion volume\n(mm$^3$)", labelpad=15)
+        ax.tick_params(axis="x", labelsize=24)
+        ax.tick_params(axis="y", labelsize=24)
+        ax.grid(True, linestyle="--", alpha=0.4)
+
+        ax.set_xticks(xticks_int)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.xaxis.set_major_formatter(FormatStrFormatter('%d'))
+
+    for k in range(len(axes)):
+        if k not in plotted_axes:
+            fig.delaxes(axes[k])
+
+    plt.suptitle(
+        f"Longitudinal Lesion Volume by Region ({display_split} Set - Consensus Average)",
+        fontsize=42,
+        fontweight="bold",
+        y=0.995
+    )
+
+    handles, labels = [], []
+    seen = set()
+    for ax_idx in plotted_axes:
+        h, l = axes[ax_idx].get_legend_handles_labels()
+        for hh, ll in zip(h, l):
+            if ll not in seen:
+                handles.append(hh)
+                labels.append(ll)
+                seen.add(ll)
+
+    if handles:
+        ncol_legend = 5 if len(labels) >= 10 else max(1, len(labels))
+        fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.975), ncol=ncol_legend)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96], pad=3.0)
+    plt.savefig(FIG_ESSENTIAL / outname, dpi=300, bbox_inches="tight", pad_inches=0.2)
+    plt.close()
+    print(f"Saved plot: {outname}")
+
+plot_consensus_linegraphs(df_long_consensus, "TRAIN", "Training", "LineGraphs_TRAIN_Consensus_Average.png")
+plot_consensus_linegraphs(df_long_consensus, "TEST", "Testing", "LineGraphs_TEST_Consensus_Average.png")
+plot_consensus_linegraphs(df_long_consensus, "WHOLE_COHORT", "Whole Cohort", "LineGraphs_WHOLE_COHORT_Consensus_Average.png")
+
+print("\n" + "="*80)
+print(" GENERATING PER-PATIENT RAW VOLUMES AND MD STATS")
+print("="*80)
+
+df_patient_raw_vols = df_long[[
+    "subject", "timepoint", "Scan_Number", "split", "rater",
+    "total_lesion_mm3", "total_lesion_voxels"
+]].drop_duplicates()
+df_patient_raw_vols.to_csv(IMPORTANT_CSVS / "patient_total_lesion_volumes_raw.csv", index=False)
+print("Saved raw per-patient volumes to: patient_total_lesion_volumes_raw.csv")
+
+patient_md_rows = []
+for (subj, split, rater), grp in df_patient_raw_vols.groupby(["subject", "split", "rater"]):
+    grp = grp.sort_values("Scan_Number")
+    if len(grp) < 2:
+        continue
+
+    v_first = grp.iloc[0]["total_lesion_mm3"]
+    v_last = grp.iloc[-1]["total_lesion_mm3"]
+    md_abs = v_last - v_first
+    md_pct = (md_abs / v_first * 100.0) if v_first > 0 else 0.0
+
+    patient_md_rows.append({
+        "subject": subj,
+        "split": split,
+        "rater": rater,
+        "Initial_Volume_mm3": v_first,
+        "Final_Volume_mm3": v_last,
+        "MD_abs": md_abs,
+        "MD_pct": md_pct
+    })
+
+df_patient_md = pd.DataFrame(patient_md_rows)
+df_patient_md.to_csv(IMPORTANT_CSVS / "patient_MD_abs_and_pct_Individual_Raters.csv", index=False)
+print("Saved Individual Per-Patient MD to: patient_MD_abs_and_pct_Individual_Raters.csv")
+
+patient_md_cons_rows = []
+for (subj, split), grp in df_total_consensus.groupby(["subject", "split"]):
+    grp = grp.sort_values("Scan_Number")
+    if len(grp) < 2:
+        continue
+
+    v_first = grp.iloc[0]["total_lesion_mm3"]
+    v_last = grp.iloc[-1]["total_lesion_mm3"]
+    md_abs = v_last - v_first
+    md_pct = (md_abs / v_first * 100.0) if v_first > 0 else 0.0
+
+    patient_md_cons_rows.append({
+        "subject": subj,
+        "split": split,
+        "Initial_Volume_mm3": v_first,
+        "Final_Volume_mm3": v_last,
+        "MD_abs": md_abs,
+        "MD_pct": md_pct
+    })
+
+df_patient_md_cons = pd.DataFrame(patient_md_cons_rows)
+df_patient_md_cons.to_csv(IMPORTANT_CSVS / "patient_MD_abs_and_pct_Consensus.csv", index=False)
+print("Saved Consensus Per-Patient MD to: patient_MD_abs_and_pct_Consensus.csv")
+
+def plot_patient_md_bar(df_plot, split_name, metric_col, title, ylabel, outname):
+    d = df_plot[df_plot["split"] == split_name].sort_values("subject").copy()
+    if d.empty:
+        return
+
+    bar_color = "red" if split_name == "TEST" else "blue"
+
+    plt.figure(figsize=(24, 10))
+    plt.bar(d["subject"], d[metric_col], color=bar_color, edgecolor="black")
+
+    plt.title(title, pad=24)
+    plt.ylabel(ylabel, labelpad=15)
+    plt.xlabel("Patient (Subject ID)", labelpad=15)
+
+    plt.xticks(rotation=45, ha="right")
+    plt.grid(axis="y", linestyle="--", alpha=0.7)
+    plt.tight_layout(pad=2.0)
+
+    plt.savefig(FIG_ESSENTIAL / outname, dpi=300, bbox_inches="tight", pad_inches=0.2)
+    plt.close()
+
+for split_name in ["TRAIN", "TEST"]:
+    display_split = "Training" if split_name == "TRAIN" else "Testing"
+    plot_patient_md_bar(df_patient_md_cons, split_name, "MD_abs",
+                        f"Total Patient Absolute Volume Change ($MD_{{abs}}$) - {display_split}",
+                        "Absolute change in\nlesion volume (mm$^3$)",
+                        f"BarChart_Patient_MD_abs_Consensus_{split_name}.png")
+    plot_patient_md_bar(df_patient_md_cons, split_name, "MD_pct",
+                        f"Total Patient Percentage Volume Change ($MD_{{\\%}}$) - {display_split}",
+                        "Percentage change\nin lesion volume (%)",
+                        f"BarChart_Patient_MD_pct_Consensus_{split_name}.png")
+
+print("\n" + "="*80)
+print(" GENERATING SIDE-BY-SIDE TIMEPOINT COMPARISONS")
+print("="*80)
+
+df_side_by_side_voxels = df.pivot_table(
+    index=["subject", "split", "rater", "region_name"],
+    columns="timepoint",
+    values="overlap_voxels",
+    aggfunc="first"
+).reset_index()
+
+sbs_voxels_path = IMPORTANT_CSVS / "patient_region_voxels_side_by_side_timepoints.csv"
+df_side_by_side_voxels.to_csv(sbs_voxels_path, index=False)
+print(f"Saved Side-by-Side Voxel Counts to: {sbs_voxels_path.name}")
+
+df_side_by_side_mm3 = df.pivot_table(
+    index=["subject", "split", "rater", "region_name"],
+    columns="timepoint",
+    values="overlap_mm3",
+    aggfunc="first"
+).reset_index()
+
+sbs_mm3_path = IMPORTANT_CSVS / "patient_region_mm3_side_by_side_timepoints.csv"
+df_side_by_side_mm3.to_csv(sbs_mm3_path, index=False)
+print(f"Saved Side-by-Side mm³ Volumes to: {sbs_mm3_path.name}")
+
+print("\nALL ANALYSIS COMPLETE.")
