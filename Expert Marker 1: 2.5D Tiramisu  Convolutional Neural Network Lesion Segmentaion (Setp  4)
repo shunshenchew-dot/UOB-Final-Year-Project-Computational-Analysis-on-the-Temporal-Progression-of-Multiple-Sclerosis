@@ -1,17 +1,7 @@
-#!/usr/bin/env python3
-# ============================================================
-#   LesionSeg — MASK 1 VERSION
-#   Trains on rater 1 lesion masks only
-#   Saves predicted test masks to: Checkpoints/predicted_masks/mask1_version/
-#   Writes file list to:           Checkpoints/predicted_masks/mask1_predicted_files.txt
-# ============================================================
 
 import os, shutil, glob, re, zipfile, tarfile, ast, subprocess
 from pathlib import Path
 
-# ============================================================
-# ── CONFIGURATION — edit these before running ───────────────
-# ============================================================
 
 TRAINING_ZIP  = r'C:\Users\chews\OneDrive\Desktop\ISBI2016\training_final_v4.zip'
 TEST_ZIP      = r'C:\Users\chews\OneDrive\Desktop\ISBI2016\testdata_website_2016-03-24.zip'
@@ -32,10 +22,6 @@ NITER_DECAY   = 100
 TRAIN_SIZE    = 128
 TEST_SIZE     = 256
 
-# ============================================================
-# ── HELPER: Extract archive ──────────────────────────────────
-# ============================================================
-
 def extract_any(archive_path, out_dir, label="data"):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -51,10 +37,6 @@ def extract_any(archive_path, out_dir, label="data"):
         with tarfile.open(archive_path, 'r:*') as t:
             t.extractall(out_dir)
     print(f"✓ {label} extracted")
-
-# ============================================================
-# ── STEP 4: Extract & copy training data ────────────────────
-# ============================================================
 
 print("\n" + "=" * 60)
 print("STEP 4: Extract & copy training data")
@@ -91,10 +73,6 @@ print(f"✓ Copied {copied} training files")
 if skipped:
     print(f"  Skipped {len(skipped)}: {skipped[:5]}")
 
-# ============================================================
-# ── STEP 5: Extract & copy test data ────────────────────────
-# ============================================================
-
 print("\n" + "=" * 60)
 print("STEP 5: Extract & copy test data")
 print("=" * 60)
@@ -126,9 +104,6 @@ for fpath in test_nii:
 
 print(f"✓ Copied {copied_t} test files to challenge/")
 
-# ============================================================
-# ── STEP 6: Patch train.py / test.py ────────────────────────
-# ============================================================
 
 print("\n" + "=" * 60)
 print("STEP 6: Patching repo files")
@@ -140,10 +115,6 @@ for fname in ['train.py', 'test.py']:
     txt = txt.replace('num_workers=opt.num_threads', 'num_workers=4')
     p.write_text(txt)
     print(f"  ✓ {fname} patched")
-
-# ============================================================
-# ── STEP 7: Patch firstconv ──────────────────────────────────
-# ============================================================
 
 print("\n" + "=" * 60)
 print("STEP 7: Patching tiramisu_model.py firstconv")
@@ -182,10 +153,6 @@ ast.parse(fixed)
 tira_path.write_text(fixed)
 print("✓ firstconv patched → nn.Conv2d(12, 48, kernel_size=3, padding=1)")
 
-# ============================================================
-# ── STEP 8: Write configurations.py (mask1 only) ────────────
-# ============================================================
-
 print("\n" + "=" * 60)
 print("STEP 8: Writing configurations.py for MASK 1")
 print("=" * 60)
@@ -205,10 +172,6 @@ SEED = 42
 (REPO_DIR / 'configurations.py').write_text(config)
 print("✓ configurations.py written  (MASKS = ['mask1'])")
 
-# ============================================================
-# ── STEP 9: Data conversion ──────────────────────────────────
-# ============================================================
-
 print("\n" + "=" * 60)
 print("STEP 9: Data conversion")
 print("=" * 60)
@@ -216,9 +179,6 @@ os.chdir(REPO_DIR)
 os.system('python -u data_conversion.py')
 print("✓ Data conversion done")
 
-# ============================================================
-# ── STEP 10: TRAIN ───────────────────────────────────────────
-# ============================================================
 
 print("\n" + "=" * 60)
 print("STEP 10: Training on MASK 1")
@@ -235,9 +195,6 @@ train_cmd = (
 os.system(train_cmd)
 print(f"✓ Training complete — {EXPERIMENT}")
 
-# ============================================================
-# ── STEP 11: INFERENCE on test set ──────────────────────────
-# ============================================================
 
 print("\n" + "=" * 60)
 print("STEP 11: Inference on test set")
@@ -267,9 +224,6 @@ with open(TXT_FILE, 'w') as f:
 
 print(f"✓ File list written → {TXT_FILE}")
 
-# ============================================================
-# ── STEP 12: INFERENCE on val set + visualise + Dice ─────────
-# ============================================================
 
 print("\n" + "=" * 60)
 print("STEP 12: Inference on val set + visualisation + Dice")
@@ -357,7 +311,6 @@ if scores:
     print("  " + "─" * 32)
     print(f"  {'Mean Dice':>21} {sum(d for _,_,d in scores)/len(scores):>8.4f}")
 
-# ============================================================
 print("\n" + "=" * 60)
 print("MASK 1 PIPELINE COMPLETE")
 print("=" * 60)
