@@ -1,0 +1,319 @@
+import re
+import gzip
+import uuid
+import numpy as np
+from pathlib import Path
+
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+
+
+ROOT = Path(r"C:\Users\chews\OneDrive\Desktop\New FYP\ALL SCENES")
+
+#Macro Segments
+MACRO = {
+    1:  ("Basal Ganglia (Reward & Behaviour)",                 (0.90, 0.20, 0.20)),
+    2:  ("Cerebellum (Balance & Coordination)",                (0.20, 0.75, 0.35)),
+    3:  ("Brainstem (Basic Life Functions)",                   (0.20, 0.45, 0.85)),
+    4:  ("Ventricular System (CSF Spaces)",                    (0.45, 0.45, 0.90)),
+    5:  ("White Matter (Inter-regional Communication)",        (0.95, 0.95, 0.95)),
+    6:  ("Frontal Lobe (Executive & Motor Functions)",         (1.00, 0.55, 0.00)),
+    7:  ("Parietal Lobe (Somatosensory & Spatial Processing)", (1.00, 0.85, 0.00)),
+    8:  ("Temporal Lobe (Auditory & Memory Processing)",       (0.55, 0.20, 0.90)),
+    9:  ("Occipital Lobe (Visual Processing)",                 (0.00, 0.75, 1.00)),
+    10: ("Insular & Cingulate Cortex (Emotion & Integration)", (0.80, 0.15, 0.55)),
+}
+MACRO_NAME = {0: "Background", **{k: v[0] for k, v in MACRO.items()}}
+
+
+def parse_legend(text: str):
+    rows = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        parts = ln.split()
+        if len(parts) < 2:
+            continue
+        try:
+            idx = int(parts[0])
+        except ValueError:
+            continue
+        
+        rows.append((idx, parts[1]))
+    rows.sort(key=lambda x: x[0])
+    return rows
+
+def classify_to_macro10(name: str) -> int:
+    n = name.lower()
+
+    if n == "background":
+        return 0
+    if "ventricle" in n or "csf" in n or "non-ventricular" in n:
+        return 4
+    if "cerebell" in n or "vermal" in n:
+        return 2
+    if "brain-stem" in n or "brainstem" in n or "pons" in n:
+        return 3
+    if "white-matter" in n or "corpus-callosum" in n or "periventricular-white-matter" in n:
+        return 5
+
+    deepgm = [
+        "thalamus","caudate","putamen","pallidum","ventral-dc","accumbens",
+        "claustrum","basal-forebrain","amygdala","hippocampus","vessel","optic-chiasm"
+    ]
+    if any(k in n for k in deepgm):
+        return 1
+
+    if "insula" in n or "cingulate" in n:
+        return 10
+
+    frontal   = ["frontal","frp","mfg","mfc","msfg","sfg","opifg","orifg","trifg","fo","aorg","morg","lorg","prg","smc","gyrus-rectus","subcallosal"]
+    temporal  = ["temporal","stg","mtg","itg","tmp","ttg","fug","ofug","pt","pp","entorhinal","parahippocampal"]
+    parietal  = ["parietal","pcu","spl","smg","ang","postcentral","central-operculum","parietal-operculum","po-"]
+    occipital = ["occipital","calc","cun","lig","mog","iog","sog","ocp","lingual","cuneus","calcarine"]
+
+    if any(k in n for k in frontal):   return 6
+    if any(k in n for k in temporal):  return 8
+    if any(k in n for k in parietal):  return 7
+    if any(k in n for k in occipital): return 9
+
+    return 10  
+
+def read_header_payload(path: Path):
+    data = path.read_bytes()
+    m = re.search(br"\n\s*\n", data)
+    if not m:
+        raise ValueError(f"No NRRD header separator found in {path}")
+    header = data[:m.end()].decode("ascii", errors="ignore")
+    payload = data[m.end():]
+    return header, payload
+
+def field(header: str, key: str):
+    mm = re.search(rf"^{re.escape(key)}:\s*(.+)\s*$", header, flags=re.MULTILINE)
+    return mm.group(1).strip() if mm else None
+
+def dtype_from(typ: str):
+    t = typ.strip().lower()
+    mp = {
+        "unsigned char": np.uint8, "uchar": np.uint8, "uint8": np.uint8,
+        "short": np.int16, "int16": np.int16,
+        "ushort": np.uint16, "uint16": np.uint16,
+        "int": np.int32, "int32": np.int32,
+        "uint32": np.uint32,
+    }
+    if t not in mp:
+        raise ValueError(f"Unsupported NRRD type: {typ!r}")
+    return mp[t]
+
+def load_nrrd(path: Path):
+    hdr, payload = read_header_payload(path)
+    sizes_str = field(hdr, "sizes")
+    enc = (field(hdr, "encoding") or "").lower()
+    typ = field(hdr, "type")
+
+    if sizes_str is None or typ is None:
+        raise ValueError(f"Missing required NRRD fields (sizes/type) in {path}")
+
+    sizes = tuple(int(x) for x in sizes_str.split())
+
+    raw = gzip.decompress(payload) if enc == "gzip" else payload
+    arr = np.frombuffer(raw, dtype=dtype_from(typ))
+    vol = arr.reshape(sizes, order="C")
+    return vol, hdr
+
+
+def write_macro10_seg(out_path: Path, fine_header: str, macro_vol_u8: np.ndarray):
+    space = field(fine_header, "space") or "left-posterior-superior"
+    sizes = field(fine_header, "sizes")
+    space_dirs = field(fine_header, "space directions")
+    space_origin = field(fine_header, "space origin")
+    kinds = field(fine_header, "kinds") or "domain domain domain"
+
+    if sizes is None or space_dirs is None or space_origin is None:
+        raise ValueError("Missing sizes/space directions/space origin in input NRRD header.")
+
+    lines = [
+        "NRRD0005",
+        "# Created by script: fine->macro10 segmentation",
+        "type: uint8",
+        "dimension: 3",
+        f"space: {space}",
+        f"sizes: {sizes}",
+        f"space directions: {space_dirs}",
+        f"kinds: {kinds}",
+        "encoding: gzip",
+        f"space origin: {space_origin}",
+    ]
+
+    for seg_index, label_value in enumerate(range(1, 11)):
+        name, (r, g, b) = MACRO[label_value]
+        lines.append(f"Segment_{seg_index}_ID:={uuid.uuid4()}")
+        lines.append(f"Segment_{seg_index}_Name:={name}")
+        lines.append(f"Segment_{seg_index}_Color:={r:.3f} {g:.3f} {b:.3f}")
+        lines.append(f"Segment_{seg_index}_LabelValue:={label_value}")
+
+    lines.append("SegmentCount:=10")
+    header = "\n".join(lines) + "\n\n"
+
+    raw = macro_vol_u8.astype(np.uint8, copy=False).reshape(-1, order="C").tobytes()
+    gz = gzip.compress(raw)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(header.encode("ascii", errors="ignore") + gz)
+
+
+def autosize(ws):
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            val = "" if cell.value is None else str(cell.value)
+            max_len = max(max_len, len(val))
+        ws.column_dimensions[col_letter].width = min(80, max(12, max_len + 2))
+
+def write_grouping_xlsx(out_xlsx: Path, legend_rows):
+    fine_to_macro = []
+    macro_to_fine = {k: [] for k in range(0, 11)}  
+
+    for fine_id, fine_name in legend_rows:
+        macro_id = classify_to_macro10(fine_name)
+        fine_to_macro.append((fine_id, fine_name, macro_id, MACRO_NAME.get(macro_id, f"Macro{macro_id}")))
+        macro_to_fine.setdefault(macro_id, []).append((fine_id, fine_name))
+
+    fine_to_macro.sort(key=lambda x: x[0])
+    for k in macro_to_fine:
+        macro_to_fine[k].sort(key=lambda x: x[0])
+
+    wb = Workbook()
+
+    ws1 = wb.active
+    ws1.title = "Fine_to_Macro"
+    ws1.append(["fine_id", "fine_name", "macro_id", "macro_name"])
+    for row in fine_to_macro:
+        ws1.append(list(row))
+    autosize(ws1)
+
+    ws2 = wb.create_sheet("Macro_to_Fine")
+    ws2.append(["macro_id", "macro_name", "fine_id", "fine_name"])
+    for macro_id in range(0, 11):
+        macro_name = MACRO_NAME.get(macro_id, f"Macro{macro_id}")
+        items = macro_to_fine.get(macro_id, [])
+        if not items:
+            ws2.append([macro_id, macro_name, "", ""])
+        else:
+            for fine_id, fine_name in items:
+                ws2.append([macro_id, macro_name, fine_id, fine_name])
+    autosize(ws2)
+
+    out_xlsx.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_xlsx)
+
+
+def find_segmentation_file(time_folder: Path) -> Path | None:
+    
+    preferred = time_folder / "Segmentation.seg.nrrd"
+    if preferred.exists():
+        return preferred
+
+    
+    candidates = []
+    for p in time_folder.glob("*.nrrd"):
+        name = p.name.lower()
+        if "macro10" in name:
+            continue
+        if "segmentation" in name:
+            candidates.append(p)
+
+    if not candidates:
+        return None
+
+    
+    candidates.sort(key=lambda x: (len(x.name), x.name))
+    return candidates[0]
+
+def find_legend_file(time_folder: Path) -> Path | None:
+    preferred = time_folder / "label_legend.txt"
+    if preferred.exists():
+        return preferred
+
+    
+    for p in time_folder.iterdir():
+        if p.is_file() and p.name.lower().startswith("label_legend"):
+            return p
+    return None
+
+
+def process_time_folder(time_folder: Path):
+    seg_path = find_segmentation_file(time_folder)
+    legend_path = find_legend_file(time_folder)
+
+    print("\n=== CHECKING FOLDER ===")
+    print("Folder:", time_folder)
+    print("Seg file   :", seg_path if seg_path else "NOT FOUND")
+    print("Legend file:", legend_path if legend_path else "NOT FOUND")
+    try:
+        print("Files here:", [p.name for p in time_folder.iterdir()])
+    except Exception as e:
+        print("Could not list folder contents:", e)
+
+    if seg_path is None or legend_path is None:
+        print(f"⚠ Skipping {time_folder} (missing segmentation or legend)")
+        return False
+
+    out_seg  = time_folder / "macro10.seg.nrrd"
+    out_xlsx = time_folder / "macro10_grouping.xlsx"
+
+    try:
+        fine_vol, fine_hdr = load_nrrd(seg_path)
+        legend_rows = parse_legend(legend_path.read_text(encoding="utf-8", errors="ignore"))
+
+        if not legend_rows:
+            raise ValueError(f"Legend parsed to 0 rows: {legend_path}")
+
+        
+        write_grouping_xlsx(out_xlsx, legend_rows)
+
+        
+        max_id = int(fine_vol.max())
+        lut = np.zeros(max_id + 1, dtype=np.uint8)
+        for idx, name in legend_rows:
+            if 0 <= idx <= max_id:
+                lut[idx] = np.uint8(classify_to_macro10(name))
+        lut[0] = 0
+
+        macro_vol = lut[fine_vol.astype(np.int64)]
+        write_macro10_seg(out_seg, fine_hdr, macro_vol.astype(np.uint8))
+
+        print(f"✓ {time_folder} -> macro10.seg.nrrd + macro10_grouping.xlsx")
+        return True
+    except Exception as e:
+        print(f"✗ Failed {time_folder}: {e}")
+        return False
+
+def main():
+    if not ROOT.exists():
+        raise FileNotFoundError(f"ROOT not found: {ROOT}")
+
+    subjects = sorted([p for p in ROOT.glob("SUBJ*") if p.is_dir()])
+    print(f"Found {len(subjects)} subjects under {ROOT}")
+
+    ok = 0
+    fail = 0
+
+    for subj in subjects:
+        time_folders = sorted([t for t in subj.glob("Time*") if t.is_dir() and re.match(r"^Time\d+$", t.name)])
+        if not time_folders:
+            print(f"⚠ No Time folders in {subj}")
+            continue
+
+        for tf in time_folders:
+            if process_time_folder(tf):
+                ok += 1
+            else:
+                fail += 1
+
+    print(f"\nDone. Success: {ok} | Failed/Skipped: {fail}")
+
+if __name__ == "__main__":
+    main()
