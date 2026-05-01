@@ -1,0 +1,535 @@
+
+
+import os, shutil, glob, re, zipfile, tarfile, ast, subprocess
+from pathlib import Path
+
+
+
+TRAINING_ZIP  = r'C:\Users\chews\OneDrive\Desktop\ISBI2016\training_final_v4.zip'
+TEST_ZIP      = r'C:\Users\chews\OneDrive\Desktop\ISBI2016\testdata_website_2016-03-24.zip'
+WORK_DIR      = Path(r'C:\Users\chews\OneDrive\Desktop\LesionSeg_Work')
+DATASET_DIR   = WORK_DIR / 'sample_dataset'
+CHALLENGE_DIR = DATASET_DIR / 'challenge'
+CKPT_DIR      = WORK_DIR / 'Checkpoints'
+REPO_DIR      = WORK_DIR / 'LesionSeg' / 'LesionSeg-master'
+
+EXPERIMENT    = 'isbi_focal_mask2'
+RESULTS_DIR   = CKPT_DIR / 'predicted_masks' / 'mask2_version'
+TXT_FILE      = CKPT_DIR / 'predicted_masks' / 'mask2_predicted_files.txt'
+VIS_DIR       = CKPT_DIR / 'predicted_masks' / 'mask2_visualisations'
+
+# NEW: training prediction outputs
+TRAIN_RESULTS_DIR = CKPT_DIR / 'predicted_masks' / 'mask2_training_version'
+TRAIN_TXT_FILE    = CKPT_DIR / 'predicted_masks' / 'mask2_training_predicted_files.txt'
+TRAIN_CHALLENGE_DIR = DATASET_DIR / 'challenge_training_inputs_only'
+
+EXPERIMENT    = 'isbi_focal_mask2'
+RESULTS_DIR   = CKPT_DIR / 'predicted_masks' / 'mask2_version'
+TXT_FILE      = CKPT_DIR / 'predicted_masks' / 'mask2_predicted_files.txt'
+VIS_DIR       = CKPT_DIR / 'predicted_masks' / 'mask2_visualisations'
+
+GPU_IDS       = '0'       # '0' for first GPU, '-1' for CPU
+NITER         = 100
+NITER_DECAY   = 100
+TRAIN_SIZE    = 128
+TEST_SIZE     = 256
+
+
+
+def run(cmd: str):
+    print(f"\n$ {cmd}\n")
+    result = subprocess.run(cmd, shell=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Command failed (exit {result.returncode}):\n  {cmd}")
+
+
+
+print("\n" + "=" * 60)
+print("STEP 3: Creating directories")
+print("=" * 60)
+for d in [DATASET_DIR, CHALLENGE_DIR, CKPT_DIR, RESULTS_DIR, VIS_DIR, TRAIN_RESULTS_DIR, TRAIN_CHALLENGE_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+    print(f"  ✓ {d}")
+
+
+
+def extract_any(archive_path, out_dir, label="data"):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not Path(archive_path).exists():
+        raise FileNotFoundError(f"{label} archive not found: {archive_path}")
+    with open(archive_path, 'rb') as f:
+        header = f.read(4).hex()
+    if header.startswith('504b'):
+        with zipfile.ZipFile(archive_path, 'r') as z:
+            z.extractall(out_dir)
+    elif header.startswith('1f8b'):
+        with tarfile.open(archive_path, 'r:gz') as t:
+            t.extractall(out_dir)
+    else:
+        with tarfile.open(archive_path, 'r:*') as t:
+            t.extractall(out_dir)
+    print(f"✓ {label} extracted")
+
+
+print("\n" + "=" * 60)
+print("STEP 4: Extract & copy training data")
+print("=" * 60)
+
+TRAIN_EXTRACT = WORK_DIR / 'training_extracted'
+extract_any(TRAINING_ZIP, TRAIN_EXTRACT, "Training data")
+
+train_nii = glob.glob(str(TRAIN_EXTRACT / '**' / '*.nii*'), recursive=True)
+print(f"  Found {len(train_nii)} training NIfTI files")
+
+MODALITY_MAP = {
+    'mprage_pp': 't1',  'mprage': 't1',  't1': 't1',
+    'flair_pp':  'flair', 'flair': 'flair',
+    't2_pp':     't2',  't2': 't2',
+    'pd_pp':     'pd',  'pd': 'pd',
+    'mask1':     'mask1',
+    'mask2':     'mask2',
+}
+
+PAT_TRAIN = re.compile(r'^training(\d{2})_(\d{2})_(.+?)(\.nii(?:\.gz)?)$')
+copied, skipped = 0, []
+for fpath in train_nii:
+    fname = os.path.basename(fpath)
+    m = PAT_TRAIN.match(fname)
+    if not m: skipped.append(fname); continue
+    patient, timepoint, mod_raw, ext = m.groups()
+    modality = MODALITY_MAP.get(mod_raw)
+    if not modality: skipped.append(fname); continue
+    shutil.copy2(fpath, str(DATASET_DIR / f'training_{patient}_{timepoint}_{modality}{ext}'))
+    copied += 1
+
+print(f"✓ Copied {copied} training files")
+if skipped:
+    print(f"  Skipped {len(skipped)}: {skipped[:5]}")
+
+
+
+print("\n" + "=" * 60)
+print("STEP 5: Extract & copy test data")
+print("=" * 60)
+
+TEST_EXTRACT = WORK_DIR / 'test_extracted'
+extract_any(TEST_ZIP, TEST_EXTRACT, "Test data")
+
+test_nii = glob.glob(str(TEST_EXTRACT / '**' / '*.nii*'), recursive=True)
+print(f"  Found {len(test_nii)} test NIfTI files")
+
+PAT_TEST     = re.compile(r'^(training|test)(\d{2})_(\d{2})_(.+?)(\.nii(?:\.gz)?)$')
+TEST_MOD_MAP = {
+    'mprage': 't1', 'mprage_pp': 't1',
+    'flair':  'flair', 'flair_pp': 'flair',
+    't2':     't2',  't2_pp': 't2',
+    'pd':     'pd',  'pd_pp': 'pd',
+}
+
+copied_t = 0
+for fpath in test_nii:
+    fname = os.path.basename(fpath)
+    m = PAT_TEST.match(fname)
+    if not m: continue
+    pref, patient, timepoint, mod_raw, ext = m.groups()
+    modality = TEST_MOD_MAP.get(mod_raw)
+    if not modality: continue
+    shutil.copy2(fpath, str(CHALLENGE_DIR / f'training_{patient}_{timepoint}_{modality}{ext}'))
+    copied_t += 1
+
+print(f"✓ Copied {copied_t} test files to challenge/")
+
+
+
+print("\n" + "=" * 60)
+print("STEP 6: Patching repo files")
+print("=" * 60)
+
+# ── patch num_workers in train.py and test.py ────────────────
+for fname in ['train.py', 'test.py']:
+    p = REPO_DIR / fname
+    if not p.exists():
+        raise FileNotFoundError(f"Repo file not found: {p}\n"
+                                f"Check that REPO_DIR is correct: {REPO_DIR}")
+    txt = p.read_text()
+    txt = txt.replace('num_workers=opt.num_threads', 'num_workers=4')
+    p.write_text(txt)
+    print(f"  ✓ {fname} patched (num_workers)")
+
+# ── patch visualizer.py so visdom is optional ────────────────
+# Without this patch the script crashes with an ImportError on
+# machines where visdom is not installed (including the HPC).
+viz_path = REPO_DIR / 'util' / 'visualizer.py'
+if not viz_path.exists():
+    print("  WARNING: visualizer.py not found, skipping visdom patch")
+else:
+    txt = viz_path.read_text()
+    if 'import visdom' in txt and 'visdom = None' not in txt:
+        def _wrap_import(m):
+            ind = m.group(1)
+            return (
+                f"{ind}try:\n"
+                f"{ind}    import visdom\n"
+                f"{ind}except Exception:\n"
+                f"{ind}    visdom = None"
+            )
+        txt = re.sub(r'^(\s*)import visdom\s*$', _wrap_import, txt, flags=re.MULTILINE)
+    needle = "self.vis = visdom.Visdom(server=opt.display_server, port=opt.display_port, env=opt.display_env)"
+    if needle in txt:
+        txt = txt.replace(
+            needle,
+            "if visdom is None:\n"
+            "            self.use_visdom = False\n"
+            "            self.vis = None\n"
+            "            print('WARNING: visdom not installed, visualisation disabled')\n"
+            "        else:\n"
+            "            self.use_visdom = True\n"
+            "            self.vis = visdom.Visdom(server=opt.display_server, port=opt.display_port, env=opt.display_env)"
+        )
+    viz_path.write_text(txt)
+    print("  ✓ visualizer.py patched (visdom optional)")
+
+
+print("\n" + "=" * 60)
+print("STEP 7: Patching tiramisu_model.py firstconv")
+print("=" * 60)
+
+tira_path = REPO_DIR / 'models' / 'tiramisu_model.py'
+if not tira_path.exists():
+    raise FileNotFoundError(f"tiramisu_model.py not found: {tira_path}")
+
+lines = tira_path.read_text().splitlines()
+clean_lines = []
+i = 0
+while i < len(lines):
+    line = lines[i]
+    if (('firstconv' in line or "add_module('firstconv'" in line)
+            and 'Conv2d' in line and 'out = ' not in line):
+        indent = len(line) - len(line.lstrip())
+        clean_lines.append(
+            ' ' * indent +
+            'self.firstconv = nn.Conv2d(12, 48, kernel_size=3, padding=1)'
+        )
+        i += 1
+        while i < len(lines):
+            s = lines[i].strip()
+            if (s in ('', ')', '))') or
+                    any(s.startswith(k) for k in (
+                        'out_channels', 'kernel_size', 'stride',
+                        'padding', 'bias', 'in_channels'))):
+                i += 1
+            else:
+                break
+        continue
+    clean_lines.append(line)
+    i += 1
+
+fixed = '\n'.join(clean_lines)
+ast.parse(fixed)   # raises SyntaxError immediately if broken
+tira_path.write_text(fixed)
+print("✓ firstconv patched -> nn.Conv2d(12, 48, kernel_size=3, padding=1)")
+
+
+
+print("\n" + "=" * 60)
+print("STEP 8: Writing configurations.py for MASK 2")
+print("=" * 60)
+
+dataset_path = DATASET_DIR.as_posix()
+config = (
+    "import os\n"
+    f"PATH_DATASET = '{dataset_path}'\n"
+    "MODALITIES = ['t1', 'flair', 't2', 'pd']\n"
+    "MASKS = ['mask2']\n"
+    "SUFFIX = 'nii'\n"
+    "AXIS_TO_TAKE = [2, 0, 1]\n"
+    "FOLD = 0\n"
+    "TEST_MODE = 'val'\n"
+    "SEED = 42\n"
+)
+(REPO_DIR / 'configurations.py').write_text(config)
+print("✓ configurations.py written  (MASKS = ['mask2'])")
+
+
+
+print("\n" + "=" * 60)
+print("STEP 9: Data conversion")
+print("=" * 60)
+os.chdir(REPO_DIR)
+run('python -u data_conversion.py')
+print("✓ Data conversion done")
+
+
+print("\n" + "=" * 60)
+print("STEP 10: Training on MASK 2")
+print("=" * 60)
+
+os.chdir(REPO_DIR)
+ckpt_posix = CKPT_DIR.as_posix()
+run(
+    f"python -u train.py"
+    f" --loss_to_use focal"
+    f" --input_nc 4"
+    f" --trainSize {TRAIN_SIZE}"
+    f" --test_mode val"
+    f" --name {EXPERIMENT}"
+    f" --checkpoints_dir {ckpt_posix}"
+    f" --niter {NITER}"
+    f" --niter_decay {NITER_DECAY}"
+    f" --display_id 0"
+    f" --num_threads 4"
+    f" --val_epoch_freq 9999"
+    f" --save_epoch_freq 1"
+    f" --gpu_ids {GPU_IDS}"
+)
+print(f"✓ Training complete — {EXPERIMENT}")
+
+
+print("\n" + "=" * 60)
+print("STEP 11: Inference on test set")
+print("=" * 60)
+
+os.chdir(REPO_DIR)
+run(
+    f"python -u test.py"
+    f" --input_nc 4"
+    f" --testSize {TEST_SIZE}"
+    f" --name {EXPERIMENT}"
+    f" --epoch 200"
+    f" --load_str val0,val1,val2,val3,val4"
+    f" --num_threads 4"
+    f" --phase challenge"
+    f" --checkpoints_dir {ckpt_posix}"
+    f" --gpu_ids {GPU_IDS}"
+)
+
+pred_files = sorted(glob.glob(str(CHALLENGE_DIR / f'*pred_{EXPERIMENT}*.nii*'), recursive=True))
+if not pred_files:
+    pred_files = sorted(glob.glob(str(CHALLENGE_DIR / '*pred_*.nii*'), recursive=True))
+
+saved = []
+for src in pred_files:
+    dest = RESULTS_DIR / os.path.basename(src)
+    shutil.copy2(src, str(dest))
+    saved.append(str(dest))
+
+print(f"✓ {len(saved)} predicted masks saved -> {RESULTS_DIR}")
+
+with open(TXT_FILE, 'w') as f:
+    f.write("# Predicted lesion masks — MASK 2 version\n")
+    f.write(f"# Experiment : {EXPERIMENT}\n")
+    f.write(f"# Output dir : {RESULTS_DIR}\n")
+    f.write(f"# Total files: {len(saved)}\n#\n")
+    for p in sorted(saved):
+        f.write(p + '\n')
+
+print(f"✓ File list written -> {TXT_FILE}")
+
+print("\n" + "=" * 60)
+print("STEP 11B: Inference on training inputs")
+print("=" * 60)
+
+# clear old pseudo-challenge files
+for oldf in TRAIN_CHALLENGE_DIR.glob('*'):
+    if oldf.is_file():
+        oldf.unlink()
+
+# copy only training input modalities, NOT masks
+train_input_patterns = [
+    str(DATASET_DIR / 'training_*_*_t1.nii'),
+    str(DATASET_DIR / 'training_*_*_t1.nii.gz'),
+    str(DATASET_DIR / 'training_*_*_flair.nii'),
+    str(DATASET_DIR / 'training_*_*_flair.nii.gz'),
+    str(DATASET_DIR / 'training_*_*_t2.nii'),
+    str(DATASET_DIR / 'training_*_*_t2.nii.gz'),
+    str(DATASET_DIR / 'training_*_*_pd.nii'),
+    str(DATASET_DIR / 'training_*_*_pd.nii.gz'),
+]
+
+copied_train_inputs = 0
+for pat in train_input_patterns:
+    for src in glob.glob(pat):
+        dest = TRAIN_CHALLENGE_DIR / os.path.basename(src)
+        shutil.copy2(src, dest)
+        copied_train_inputs += 1
+
+print(f"✓ Copied {copied_train_inputs} training modality files -> {TRAIN_CHALLENGE_DIR}")
+
+# backup current real challenge files
+REAL_CHALLENGE_BACKUP = DATASET_DIR / 'challenge_backup_for_training_prediction'
+if REAL_CHALLENGE_BACKUP.exists():
+    shutil.rmtree(REAL_CHALLENGE_BACKUP)
+REAL_CHALLENGE_BACKUP.mkdir(parents=True, exist_ok=True)
+
+for f in CHALLENGE_DIR.glob('*'):
+    if f.is_file():
+        shutil.copy2(f, REAL_CHALLENGE_BACKUP / f.name)
+
+# replace challenge folder contents with training inputs
+for f in CHALLENGE_DIR.glob('*'):
+    if f.is_file():
+        f.unlink()
+
+for f in TRAIN_CHALLENGE_DIR.glob('*'):
+    if f.is_file():
+        shutil.copy2(f, CHALLENGE_DIR / f.name)
+
+print("✓ challenge/ temporarily replaced with training inputs")
+
+# run exactly the same working inference pathway
+os.chdir(REPO_DIR)
+run(
+    f"python -u test.py"
+    f" --input_nc 4"
+    f" --testSize {TEST_SIZE}"
+    f" --name {EXPERIMENT}"
+    f" --epoch 200"
+    f" --load_str val0,val1,val2,val3,val4"
+    f" --num_threads 4"
+    f" --phase challenge"
+    f" --checkpoints_dir {ckpt_posix}"
+    f" --gpu_ids {GPU_IDS}"
+)
+
+train_pred_files = sorted(glob.glob(str(CHALLENGE_DIR / f'*pred_{EXPERIMENT}*.nii*'), recursive=True))
+if not train_pred_files:
+    train_pred_files = sorted(glob.glob(str(CHALLENGE_DIR / '*pred_*.nii*'), recursive=True))
+
+saved_train = []
+for src in train_pred_files:
+    dest = TRAIN_RESULTS_DIR / os.path.basename(src)
+    shutil.copy2(src, str(dest))
+    saved_train.append(str(dest))
+
+print(f"✓ {len(saved_train)} predicted TRAINING masks saved -> {TRAIN_RESULTS_DIR}")
+
+with open(TRAIN_TXT_FILE, 'w') as f:
+    f.write("# Predicted lesion masks on training inputs — MASK 2 version\n")
+    f.write(f"# Experiment : {EXPERIMENT}\n")
+    f.write(f"# Output dir : {TRAIN_RESULTS_DIR}\n")
+    f.write(f"# Total files: {len(saved_train)}\n#\n")
+    for p in sorted(saved_train):
+        f.write(p + '\n')
+
+print(f"✓ Training prediction file list written -> {TRAIN_TXT_FILE}")
+
+# clean challenge folder after training prediction
+for f in CHALLENGE_DIR.glob('*'):
+    if f.is_file():
+        f.unlink()
+
+# restore original challenge/test files
+for f in REAL_CHALLENGE_BACKUP.glob('*'):
+    if f.is_file():
+        shutil.copy2(f, CHALLENGE_DIR / f.name)
+
+print("✓ challenge/ restored to original test-set contents")
+
+
+print("\n" + "=" * 60)
+print("STEP 12: Inference on val set + visualisation + Dice")
+print("=" * 60)
+
+os.chdir(REPO_DIR)
+run(
+    f"python -u test.py"
+    f" --input_nc 4"
+    f" --testSize {TEST_SIZE}"
+    f" --name {EXPERIMENT}"
+    f" --epoch 200"
+    f" --load_str val0"
+    f" --num_threads 4"
+    f" --phase val"
+    f" --checkpoints_dir {ckpt_posix}"
+    f" --gpu_ids {GPU_IDS}"
+)
+
+import nibabel as nib
+import numpy as np
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
+
+def dice_score(pred, gt, thr=0.5):
+    p = (pred > thr).astype(float)
+    g = (gt   > thr).astype(float)
+    return 2.0 * (p * g).sum() / (p.sum() + g.sum() + 1e-8)
+
+val_preds = sorted(glob.glob(str(CKPT_DIR / EXPERIMENT / 'results' / '**' / '*.nii*'), recursive=True))
+scores = []
+
+for pred_path in val_preds:
+    pred_path = Path(pred_path)
+    m = re.search(r'(\d{2})_(\d{2})', pred_path.name)
+    if not m: continue
+    patient, timepoint = m.groups()
+
+    pred_vol = nib.load(str(pred_path)).get_fdata()
+
+    gt_hits = sorted(glob.glob(str(DATASET_DIR / f'**/*{patient}_{timepoint}_mask2*'), recursive=True))
+    gt_vol  = nib.load(gt_hits[0]).get_fdata() if gt_hits else np.zeros_like(pred_vol)
+
+    bg_hits = sorted(glob.glob(str(DATASET_DIR / f'**/*{patient}_{timepoint}_t1*'), recursive=True))
+    if bg_hits:
+        bg_vol = nib.load(bg_hits[0]).get_fdata().astype(float)
+        bg_vol = (bg_vol - bg_vol.min()) / (bg_vol.max() - bg_vol.min() + 1e-8)
+    else:
+        bg_vol = np.zeros_like(pred_vol)
+
+    min_z    = min(pred_vol.shape[2], gt_vol.shape[2], bg_vol.shape[2])
+    pred_vol = pred_vol[:, :, :min_z]
+    gt_vol   = gt_vol[:, :, :min_z]
+    bg_vol   = bg_vol[:, :, :min_z]
+
+    d = dice_score(pred_vol, gt_vol)
+    scores.append((patient, timepoint, d))
+
+    if HAS_MPL:
+        z      = pred_vol.shape[2]
+        slices = np.linspace(z // 4, 3 * z // 4, 5, dtype=int)
+        fig, axes = plt.subplots(3, 5, figsize=(20, 10))
+        fig.suptitle(f'MASK2 | Patient {patient} | Timepoint {timepoint} | Dice={d:.4f}',
+                     fontsize=13, fontweight='bold')
+        for row, lbl in enumerate(['T1', 'Ground Truth (red)', 'Predicted (blue)']):
+            axes[row, 0].set_ylabel(lbl, fontsize=10)
+        for col, s in enumerate(slices):
+            bg   = bg_vol[:, :, s].T
+            gt   = gt_vol[:, :, s].T
+            pred = pred_vol[:, :, s].T
+            axes[0, col].imshow(bg, cmap='gray', origin='lower')
+            axes[0, col].set_title(f'Slice {s}', fontsize=9)
+            axes[0, col].axis('off')
+            axes[1, col].imshow(bg, cmap='gray', origin='lower')
+            axes[1, col].imshow(np.ma.masked_where(gt < 0.5, gt), cmap='Reds', alpha=0.7, origin='lower')
+            axes[1, col].axis('off')
+            axes[2, col].imshow(bg, cmap='gray', origin='lower')
+            axes[2, col].imshow(np.ma.masked_where(pred < 0.5, pred), cmap='Blues', alpha=0.7, origin='lower')
+            axes[2, col].axis('off')
+        plt.tight_layout()
+        out_png = VIS_DIR / f'p{patient}_tp{timepoint}.png'
+        plt.savefig(str(out_png), dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  ✓ Saved -> {out_png}")
+
+print(f"\n  Dice scores — MASK 2")
+print(f"  {'Patient':>10} {'Timepoint':>10} {'Dice':>8}")
+print("  " + "─" * 32)
+for patient, timepoint, d in scores:
+    print(f"  {patient:>10} {timepoint:>10} {d:>8.4f}")
+if scores:
+    print("  " + "─" * 32)
+    print(f"  {'Mean Dice':>21} {sum(d for _,_,d in scores)/len(scores):>8.4f}")
+
+print("\n" + "=" * 60)
+print("MASK 2 PIPELINE COMPLETE")
+print("=" * 60)
+print(f"  Predicted test masks     -> {RESULTS_DIR}")
+print(f"  Test file list txt       -> {TXT_FILE}")
+print(f"  Predicted training masks -> {TRAIN_RESULTS_DIR}")
+print(f"  Training file list txt   -> {TRAIN_TXT_FILE}")
+print(f"  Visualisations           -> {VIS_DIR}")
