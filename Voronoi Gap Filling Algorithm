@@ -1,0 +1,409 @@
+from pathlib import Path
+import numpy as np
+import SimpleITK as sitk
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
+from scipy.ndimage import binary_fill_holes, binary_dilation, binary_closing, binary_erosion, label as scipy_label
+from skimage.filters import threshold_otsu
+
+ROOT = Path(r"C:\Users\chews\OneDrive\Desktop\New FYP\ALL SCENES")
+
+BACKGROUND_LABEL = 0
+VENTRICLE_LABEL  = 4
+MAX_CLASSES = 155
+
+REGION_INFO = {
+    0: {"name": "Background", "color": "black"},
+    1: {"name": "Basal Ganglia", "color": "#808080"},
+    2: {"name": "Cerebellum", "color": "#4B0082"},
+    3: {"name": "Brain stem", "color": "#008000"},
+    4: {"name": "ventricular septum", "color": "#0000FF"},
+    5: {"name": "white matter", "color": "#CCFF00"},
+    6: {"name": "Frontal lobe", "color": "#FF0000"},
+    7: {"name": "Parietal lobe", "color": "#00FFFF"},
+    8: {"name": "Temporal lobe", "color": "#FFFF00"},
+    9: {"name": "Occipital lobe", "color": "#FF00FF"},
+    10: {"name": "Insula", "color": "#00FF00"}
+}
+
+DELETE_PATTERNS = [
+    "*macro10_T1space_filled*",
+    "*macro_T1space_filled*",
+    "*brain_volume_stats.txt*",
+    "*comprehensive_report.txt*",
+    "*.color.txt",
+    "*T1_brainmask.nii.gz*",
+    "*T1_ventricles_mask.nii.gz*"
+]
+
+def cleanup():
+    deleted = 0
+    for pat in DELETE_PATTERNS:
+        for f in ROOT.rglob(pat):
+            if f.is_file():
+                try:
+                    f.unlink()
+                    deleted += 1
+                except Exception:
+                    pass
+    print(f"\nCleanup done. Nuked {deleted} old output files.\n")
+
+def find_label(tf: Path) -> Path | None:
+    for p in tf.rglob("*"):
+        if p.is_file() and p.name.lower() in [
+            "macro.nii", "macro.nii.gz", "macro10.nii.gz", "macro10.seg.nrrd"
+        ]:
+            return p
+    return None
+
+def candidate_t1s(tf: Path):
+    out = []
+    for p in tf.rglob("*"):
+        if p.is_file():
+            n = p.name.lower()
+            if "mprage" in n and ".nii" in n:
+                if any(x in n for x in ["lesion", "mask", "macro", "seg", "label", "pp"]):
+                    continue
+                out.append(p)
+    return out
+
+def resample_to_ref(moving_img: sitk.Image, ref_img: sitk.Image, is_label=True) -> sitk.Image:
+    if moving_img.GetDimension() != ref_img.GetDimension():
+        raise ValueError("Dimension mismatch between label and reference MRI.")
+    moving_cast = sitk.Cast(moving_img, sitk.sitkUInt16 if is_label else sitk.sitkFloat32)
+    identity_tx = sitk.Transform()
+    interp = sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear
+    return sitk.Resample(moving_cast, ref_img, identity_tx, interp, 0, moving_cast.GetPixelID())
+
+def sanitize_labels(macro_u16):
+    arr = sitk.GetArrayFromImage(macro_u16).astype(np.int64, copy=False)
+    bad = (arr < 0) | (arr > MAX_CLASSES)
+    if bad.any(): arr[bad] = 0
+    out = sitk.GetImageFromArray(arr.astype(np.uint16))
+    out.CopyInformation(macro_u16)
+    return out
+
+
+
+def fill_brain_gaps(macro_u16, t1_img):
+    macro_arr = sitk.GetArrayFromImage(macro_u16)
+    t1_arr = sitk.GetArrayFromImage(sitk.Cast(t1_img, sitk.sitkFloat32))
+    tissue_mask = (macro_arr > 0)
+
+    # Anatomically accurate  Filling without Sulci
+    donut_holes = np.zeros_like(tissue_mask)
+    for z in range(tissue_mask.shape[0]):
+        donut_holes[z] = binary_fill_holes(tissue_mask[z])
+    donut_holes = donut_holes & (~tissue_mask)
+
+
+    # Create a giant wrapper to bridge the tumor
+    large_hull = binary_closing(tissue_mask, iterations=12)
+    for z in range(large_hull.shape[0]):
+        large_hull[z] = binary_fill_holes(large_hull[z])
+    all_large_gaps = large_hull & (~tissue_mask)
+
+    # Erase thin wrinkles from the wrapper. 4 iterations destroys any gap thinner than 8 voxels.
+    fat_gaps = binary_erosion(all_large_gaps, iterations=4)
+    # Expand the fat gaps back to their original borders (clipped by the hull)
+    fat_gaps = binary_dilation(fat_gaps, iterations=6) & all_large_gaps
+
+
+    # This zone is mathematically guaranteed to contain ZERO outer wrinkles.
+    valid_fill_zone = donut_holes | fat_gaps
+
+
+    orig_vents = (macro_arr == VENTRICLE_LABEL)
+    vent_voxels = t1_arr[orig_vents & (t1_arr > 0)]
+    
+    csf_thresh = np.percentile(vent_voxels, 90) if vent_voxels.size > 50 else 100.0
+    csf_thresh *= 1.15 
+
+    # Ventricles can ONLY grow inside the master allowable zone
+    growable_fluid = valid_fill_zone & (t1_arr <= csf_thresh)
+
+    labeled_growable, _ = scipy_label(growable_fluid | orig_vents)
+    ventricle_seeds = np.unique(labeled_growable[orig_vents])
+    ventricle_seeds = ventricle_seeds[ventricle_seeds != 0]
+
+    new_ventricles = np.isin(labeled_growable, ventricle_seeds)
+
+    for z in range(new_ventricles.shape[0]):
+        new_ventricles[z] = binary_fill_holes(new_ventricles[z])
+
+    # Final Ventricle safety lock
+    new_ventricles = new_ventricles & (valid_fill_zone | orig_vents)
+    
+    updated_macro = np.copy(macro_arr)
+    updated_macro[new_ventricles] = VENTRICLE_LABEL
+
+    remaining_gaps = valid_fill_zone & (updated_macro == 0)
+
+    tissue_seeds = np.copy(updated_macro)
+    tissue_seeds[tissue_seeds == VENTRICLE_LABEL] = 0 # Ventricles can't seed tissue
+
+    tissue_seeds_sitk = sitk.GetImageFromArray(tissue_seeds)
+    tissue_seeds_sitk.CopyInformation(macro_u16)
+
+    dist_filter = sitk.DanielssonDistanceMapImageFilter()
+    dist_filter.SetInputIsBinary(False)
+    dist_filter.SetUseImageSpacing(True)
+    dist_filter.Execute(tissue_seeds_sitk)
+    nearest_tissue = sitk.GetArrayFromImage(sitk.Cast(dist_filter.GetVoronoiMap(), sitk.sitkUInt16))
+
+    # Apply Voronoi ONLY to the valid deep/tumor gaps
+    final_macro = np.copy(updated_macro)
+    final_macro[remaining_gaps] = nearest_tissue[remaining_gaps]
+
+    out_img = sitk.GetImageFromArray(final_macro)
+    out_img.CopyInformation(macro_u16)
+    return out_img
+
+
+def post_process_homogeneity(filled_macro_u16):
+    arr = sitk.GetArrayFromImage(filled_macro_u16)
+    cleaned_arr = np.zeros_like(arr)
+
+    for class_id in np.unique(arr):
+        if class_id == 0 or class_id == VENTRICLE_LABEL:
+            cleaned_arr[arr == class_id] = class_id
+            continue
+
+        class_binary = (arr == class_id).astype(np.uint8)
+        sitk_binary  = sitk.GetImageFromArray(class_binary)
+        sitk_binary.CopyInformation(filled_macro_u16)
+        cc    = sitk.ConnectedComponent(sitk_binary)
+        stats = sitk.LabelShapeStatisticsImageFilter()
+        stats.Execute(cc)
+
+        if stats.GetNumberOfLabels() > 0:
+            largest_size = max(stats.GetPhysicalSize(l) for l in stats.GetLabels())
+            cc_arr = sitk.GetArrayFromImage(cc)
+            for l in stats.GetLabels():
+                if stats.GetPhysicalSize(l) > (0.05 * largest_size):
+                    cleaned_arr[cc_arr == l] = class_id
+
+    seed_img = sitk.GetImageFromArray(cleaned_arr)
+    seed_img.CopyInformation(filled_macro_u16)
+
+    dist_filter = sitk.DanielssonDistanceMapImageFilter()
+    dist_filter.SetInputIsBinary(False)
+    dist_filter.SetUseImageSpacing(True)
+    dist_filter.Execute(seed_img)
+    nearest_arr = sitk.GetArrayFromImage(
+        sitk.Cast(dist_filter.GetVoronoiMap(), sitk.sitkUInt16)
+    )
+
+    final_arr = np.copy(cleaned_arr)
+    holes = (cleaned_arr == 0) & (arr > 0)
+    final_arr[holes] = nearest_arr[holes]
+
+    final_img = sitk.GetImageFromArray(final_arr)
+    final_img.CopyInformation(filled_macro_u16)
+    return final_img
+
+
+def remove_floating_islands(filled_macro_u16):
+    arr = sitk.GetArrayFromImage(filled_macro_u16)
+    binary_arr = (arr > 0).astype(np.uint8)
+    binary_img = sitk.GetImageFromArray(binary_arr)
+    binary_img.CopyInformation(filled_macro_u16)
+    cc    = sitk.ConnectedComponent(binary_img)
+    stats = sitk.LabelShapeStatisticsImageFilter()
+    stats.Execute(cc)
+    if stats.GetNumberOfLabels() > 0:
+        largest_cc_id = max(stats.GetLabels(), key=lambda l: stats.GetPhysicalSize(l))
+        cc_arr = sitk.GetArrayFromImage(cc)
+        arr[cc_arr != largest_cc_id] = 0
+    out_img = sitk.GetImageFromArray(arr)
+    out_img.CopyInformation(filled_macro_u16)
+    return out_img
+
+
+def save_color_table(out_txt_path, region_info_dict, max_classes=155):
+    out = ["# Color table file", "# format: label name r g b a"]
+    for label_id in range(max_classes + 1):
+        region_data = region_info_dict.get(label_id, {})
+        raw_name    = region_data.get("name", f"Region_{label_id}")
+        hex_color   = region_data.get("color", None)
+        safe_name   = raw_name.replace(" ", "_")
+        if hex_color is None:
+            extra_colors_map = cm.get_cmap('nipy_spectral', max_classes - 10)
+            color_index = label_id - 11
+            if color_index >= 0:
+                normalized_color = extra_colors_map(color_index / (max_classes - 11))
+                hex_color = mcolors.to_hex(normalized_color)
+            else:
+                hex_color = "#FFFFFF"
+        rgba = mcolors.to_rgba(hex_color)
+        r, g, b, a = [int(255 * c) for c in rgba]
+        out.append(f"{label_id} {safe_name} {r} {g} {b} 255")
+    with open(out_txt_path, "w") as f:
+        f.write("\n".join(out))
+
+
+def generate_comprehensive_report(macro_completed, labels, out_txt_path, region_info_dict):
+    spacing       = macro_completed.GetSpacing()
+    voxel_vol_mm3 = spacing[0] * spacing[1] * spacing[2]
+    macro_arr     = sitk.GetArrayFromImage(macro_completed)
+    total_brain_voxels = np.sum(macro_arr > BACKGROUND_LABEL)
+    total_brain_vol    = total_brain_voxels * voxel_vol_mm3
+
+    out = ["-" * 65,
+           " " * 15 + "COMPREHENSIVE BRAIN REPORT",
+           f"    Total Brain Volume:  {total_brain_vol:.2f} mm3",
+           "-" * 65,
+           f"{'ID':<3} | {'Region Name':<20} | {'Region Vol (mm3)':<18} | {'% of Brain':<12}",
+           "-" * 65]
+
+    wm_voxels = gm_voxels = csf_voxels = 0
+    gm_classes = [1, 2, 3, 6, 7, 8, 9, 10]
+
+    for L in labels:
+        if L == BACKGROUND_LABEL: continue
+        region_voxels = np.sum(macro_arr == L)
+        if L == 5:            wm_voxels  += region_voxels
+        elif L == 4:          csf_voxels += region_voxels
+        elif L in gm_classes: gm_voxels  += region_voxels
+        if region_voxels == 0: continue
+        region_vol = region_voxels * voxel_vol_mm3
+        pct_brain  = (region_vol / total_brain_vol) * 100.0 if total_brain_vol > 0 else 0
+        name = region_info_dict.get(L, {}).get("name", f"Region_{L}")
+        out.append(f"{L:<3} | {name:<20} | {region_vol:<18.2f} | {pct_brain:<11.2f}%")
+
+    wm_vol  = wm_voxels  * voxel_vol_mm3
+    gm_vol  = gm_voxels  * voxel_vol_mm3
+    csf_vol = csf_voxels * voxel_vol_mm3
+    out += ["=" * 65,
+            f"{'AGGREGATE TISSUE PERCENTAGES':^65}",
+            "=" * 65,
+            f"{'White Matter (WM)':<26} | {wm_vol:<18.2f} | {(wm_voxels/total_brain_voxels)*100:<11.2f}%",
+            f"{'Grey Matter (GM)':<26} | {gm_vol:<18.2f} | {(gm_voxels/total_brain_voxels)*100:<11.2f}%",
+            f"{'Cerebrospinal Fluid (CSF)':<26} | {csf_vol:<18.2f} | {(csf_voxels/total_brain_voxels)*100:<11.2f}%",
+            "-" * 65]
+
+    report = "\n".join(out)
+    print(report)
+    with open(out_txt_path, "w") as f:
+        f.write(report)
+
+
+# Visualisation Step
+def show_side_by_side(ref_img, unfilled_lbl_img, filled_lbl_img, title_text,
+                      region_info_dict, max_classes=155):
+    ref_arr          = sitk.GetArrayViewFromImage(ref_img)
+    unfilled_lbl_arr = sitk.GetArrayViewFromImage(unfilled_lbl_img)
+    filled_lbl_arr   = sitk.GetArrayViewFromImage(filled_lbl_img)
+    z_mid = ref_arr.shape[0] // 2
+
+    color_list = []
+    for label_id in range(max_classes + 1):
+        hex_color = region_info_dict.get(label_id, {}).get("color", None)
+        if hex_color is None:
+            extra_colors_map = cm.get_cmap('nipy_spectral', max_classes - 10)
+            color_index = label_id - 11
+            if color_index >= 0:
+                normalized_color = extra_colors_map(color_index / (max_classes - 11))
+                hex_color = mcolors.to_hex(normalized_color)
+            else:
+                hex_color = "#FFFFFF"
+        color_list.append(hex_color)
+    custom_cmap = mcolors.ListedColormap(color_list)
+
+    plt.figure(figsize=(18, 6))
+    plt.subplot(1, 3, 1)
+    plt.imshow(ref_arr[z_mid, :, :], cmap='gray')
+    plt.title('Original MPRAGE')
+    plt.axis('off')
+
+    plt.subplot(1, 3, 2)
+    plt.imshow(ref_arr[z_mid, :, :], cmap='gray')
+    unfilled_slice = np.ma.masked_where(
+        unfilled_lbl_arr[z_mid, :, :] == BACKGROUND_LABEL,
+        unfilled_lbl_arr[z_mid, :, :]
+    )
+    plt.imshow(unfilled_slice, cmap=custom_cmap, vmin=0, vmax=max_classes,
+               interpolation='nearest', alpha=0.5)
+    plt.title('Unfilled Macro Overlay')
+    plt.axis('off')
+
+    plt.subplot(1, 3, 3)
+    plt.imshow(ref_arr[z_mid, :, :], cmap='gray')
+    filled_slice = np.ma.masked_where(
+        filled_lbl_arr[z_mid, :, :] == BACKGROUND_LABEL,
+        filled_lbl_arr[z_mid, :, :]
+    )
+    plt.imshow(filled_slice, cmap=custom_cmap, vmin=0, vmax=max_classes,
+               interpolation='nearest', alpha=0.5)
+    plt.title('Filled Macro Overlay')
+    plt.axis('off')
+
+    plt.suptitle(title_text, fontsize=16)
+    plt.tight_layout()
+    plt.show(block=False)
+    plt.pause(10)
+    plt.close()
+
+
+def main():
+    if not ROOT.exists(): raise FileNotFoundError(f"ROOT not found: {ROOT}")
+    cleanup()
+
+    time_folders = sorted([p for p in ROOT.glob(r"SUBJ*\Time*") if p.is_dir()])
+    print(f"Found {len(time_folders)} Time folders to process\n")
+
+    ok = skip = fail = 0
+
+    for tf in time_folders:
+        lbl_path = find_label(tf)
+        t1_cands = candidate_t1s(tf)
+
+        if not lbl_path or not t1_cands:
+            skip += 1
+            continue
+
+        try:
+            print(f"\nProcessing: {tf.parent.name}/{tf.name}")
+            lbl = sitk.ReadImage(str(lbl_path))
+            ref = sitk.ReadImage(str(t1_cands[0]))
+
+            aligned_macro = resample_to_ref(lbl, ref, is_label=True)
+            aligned_macro = sanitize_labels(aligned_macro)
+
+            print("   -> Safely filling internal gaps and ventricles...")
+            filled_macro = fill_brain_gaps(aligned_macro, ref)
+            filled_macro = sanitize_labels(filled_macro)
+
+            print("   -> Enforcing homogeneity...")
+            filled_macro = post_process_homogeneity(filled_macro)
+
+            print("   -> Removing floating islands...")
+            filled_macro = remove_floating_islands(filled_macro)
+
+            print("   -> Generating Slicer Color Node...")
+            save_color_table(tf / "macro_T1space_filled.color.txt", REGION_INFO, MAX_CLASSES)
+            generate_comprehensive_report(
+                filled_macro, range(1, MAX_CLASSES + 1),
+                tf / "comprehensive_report.txt", REGION_INFO
+            )
+
+            sitk.WriteImage(filled_macro, str(tf / "macro_T1space_filled.nii.gz"),
+                            useCompression=True)
+            print(f"✓ {tf.parent.name}/{tf.name} -> Done")
+            ok += 1
+
+            print(">> Popping up visualization...")
+            show_side_by_side(ref, aligned_macro, filled_macro,
+                              f"Macro Check: {tf.parent.name} - {tf.name}",
+                              REGION_INFO, MAX_CLASSES)
+
+        except Exception as e:
+            print(f"✗ FAIL {tf}: {e}")
+            fail += 1
+
+    print(f"\nDONE. OK={ok} SKIP={skip} FAIL={fail}")
+
+
+if __name__ == "__main__":
+    main()
